@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
   int fd = open(path, O_RDONLY); if (fd < 0) { perror("open"); return 1; }
   struct stat st; fstat(fd, &st); off_t size = st.st_size;
   BASE_H = days_from_civil(2026, 10, 30) * 24 + 18 - 64;   /* slack before the span */
-  long nt = 1; /* step 1: single thread */ (void)sysconf; if (nt < 1) nt = 1; if (nt > NT_MAX) nt = NT_MAX;
+  long nt = sysconf(_SC_NPROCESSORS_ONLN); if (nt < 1) nt = 1; if (nt > NT_MAX) nt = NT_MAX;
   if (size < (1 << 20)) nt = 1;
   Th *th = calloc((size_t)nt, sizeof(Th)); pthread_t pt[NT_MAX];
   /* split at newlines */
