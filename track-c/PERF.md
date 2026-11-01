@@ -1,6 +1,6 @@
 # Track C: performance log
 
-Every number below is from the live board (i5-13500, 6 P-cores, turbo off), read from board.json. M is the kernel's peak memory in MB (10^6 bytes), S is scc lines.
+Every number below is from the live board (i5-13500, 6 P-cores, turbo off), read from board.json. M is the kernel's peak memory in MB (10^6 bytes), S is the code lines scc counts after clang-format (LLVM style).
 
 | Step | Change | Commit | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|---|---|

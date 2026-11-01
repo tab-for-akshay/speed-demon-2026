@@ -10,145 +10,92 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #define NT_MAX 64
 #define MAXREG 10000000u
-static uint8_t *regc;            /* region_id -> country index + 1 (0 = unknown) */
-static int NC;                   /* number of countries; group NC = _UNMATCHED */
-static char codes[256][4];
-static const char *F; static size_t FS;
-
+#define TB 18                     /* name table: 2^18 slots for a pool of 100,000 names */
+#define TS (1u << TB)
 typedef struct { int64_t count, idsum, asum, amin, amax, nbytes, tbytes; } Agg;
-typedef struct { const char *s; uint32_t len, hash; } Nm;
-typedef struct {
-  size_t beg, end;
-  Agg agg[257];
-  Nm *nm; int32_t *tab; uint32_t nnm, tcap;  /* name interning (unescaped) */
-  char *arena; size_t aused, acap;
-  uint32_t *pair; size_t np, pcap;           /* (local name id << 8) | group */
-  uint32_t *map;                             /* local name id -> global name id */
-} Th;
-
-static uint32_t intern(Th *t, const char *s, uint32_t len) {
-  uint32_t h = 2166136261u; for (uint32_t i = 0; i < len; i++) h = (h ^ (uint8_t)s[i]) * 16777619u;
-  if ((t->nnm + 1) * 2 > t->tcap) {   /* grow */
-    uint32_t nc = t->tcap ? t->tcap * 2 : 1 << 16; int32_t *nt = malloc(4 * (size_t)nc); memset(nt, -1, 4 * (size_t)nc);
-    for (uint32_t i = 0; i < t->nnm; i++) { uint32_t j = t->nm[i].hash & (nc - 1); while (nt[j] >= 0) j = (j + 1) & (nc - 1); nt[j] = (int32_t)i; }
-    free(t->tab); t->tab = nt; t->tcap = nc; t->nm = realloc(t->nm, sizeof(Nm) * (nc / 2 + 1));
+static uint8_t *regc; static int NC; static char codes[256][4];
+static const char *F; static size_t FS; static int NT; static size_t cut[NT_MAX + 1];
+static uint64_t *tab;             /* slot = hash:24 | len:8 | arena offset:32 */
+static char *arena; static size_t aused; static uint64_t *bits; static Agg agg[NT_MAX][257];
+/* intern a name (unescaped bytes s[0..len)) and return its slot; names are copied to one dense arena so lookups stay in cache */
+static uint32_t intern(const char *s, uint32_t len) {
+  uint64_t h = 0x9E3779B97F4A7C15ull; for (uint32_t i = 0; i < len; i++) h = (h ^ (uint8_t)s[i]) * 0x100000001B3ull;
+  h ^= h >> 29; uint32_t j = (uint32_t)h & (TS - 1); uint64_t tag = (h >> 40) << 40 | (uint64_t)len << 32;
+  for (;;) {
+    uint64_t e = __atomic_load_n(&tab[j], __ATOMIC_ACQUIRE);
+    if (!e) {
+      size_t a = __atomic_fetch_add(&aused, len, __ATOMIC_RELAXED); memcpy(arena + a, s, len);
+      if (__atomic_compare_exchange_n(&tab[j], &e, tag | a, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return j;
+    }
+    if ((e & ~0xFFFFFFFFull) == tag && memcmp(arena + (uint32_t)e, s, len) == 0) return j;
+    j = (j + 1) & (TS - 1);
   }
-  uint32_t j = h & (t->tcap - 1);
-  for (;;) { int32_t id = t->tab[j]; if (id < 0) break; Nm *n = &t->nm[id]; if (n->hash == h && n->len == len && memcmp(n->s, s, len) == 0) return (uint32_t)id; j = (j + 1) & (t->tcap - 1); }
-  if (t->aused + len > t->acap) { t->acap = t->acap ? t->acap * 2 : 1 << 20; if (t->acap < len) t->acap = len * 2; t->arena = malloc(t->acap); t->aused = 0; }
-  char *c = t->arena + t->aused; memcpy(c, s, len); t->aused += len;
-  uint32_t id = t->nnm++; t->nm[id] = (Nm){c, len, h}; t->tab[j] = (int32_t)id; return id;
 }
-
-/* parse a quoted field starting at p (on the opening quote). Writes unescaped bytes to out if out != NULL.
-   returns pointer after closing quote; *ulen = unescaped length; *esc = whether "" occurred */
-static inline const char *quoted(const char *p, uint32_t *ulen, int *esc) {
-  const char *s = p + 1; uint32_t pairs = 0; const char *q = s;
-  for (;;) { q = memchr(q, '"', (size_t)(F + FS - q)); if (q[1] == '"') { pairs++; q += 2; continue; } break; }
-  *ulen = (uint32_t)(q - s) - pairs; *esc = pairs > 0; return q + 1;
+static inline const char *quoted(const char *p, uint32_t *ulen, uint32_t *pairs) {  /* p on the opening quote */
+  const char *q = p + 1; uint32_t n = 0;
+  for (;;) { q = memchr(q, '"', (size_t)(F + FS - q)); if (q[1] != '"') break; n++; q += 2; }
+  *ulen = (uint32_t)(q - p - 1) - n; *pairs = n; return q + 1;
 }
-
 static void *work(void *arg) {
-  Th *t = arg; const char *p = F + t->beg, *e = F + t->end; char ubuf[65536];
-  for (int g = 0; g <= NC; g++) { t->agg[g].amin = INT64_MAX; t->agg[g].amax = INT64_MIN; }
+  long ti = (long)arg; const char *p = F + cut[ti], *e = F + cut[ti + 1]; Agg *A = agg[ti]; char ub[4096];
+  for (int g = 0; g <= NC; g++) A[g] = (Agg){0, 0, 0, INT64_MAX, INT64_MIN, 0, 0};
   while (p < e) {
-    if ((uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) p += 3;
+    if ((uint8_t)*p == 0xEF) p += 3;
     int64_t id = 0; while (*p != ',') id = id * 10 + (*p++ - '0'); p++;
-    /* name */
-    const char *ns; uint32_t nlen; int esc = 0;
-    if (*p == '"') { ns = p + 1; p = quoted(p, &nlen, &esc); } else { ns = p; while (*p != ',') p++; nlen = (uint32_t)(p - ns); }
-    const char *nraw = ns; uint32_t nrawlen = esc ? (uint32_t)(p - 1 - ns) : nlen;
+    const char *ns = p; uint32_t nl = 0, np = 0;
+    if (*p == '"') { p = quoted(p, &nl, &np); ns++; } else { while (*p != ',') p++; nl = (uint32_t)(p - ns); }
     p++;
-    /* note */
-    uint32_t tlen; int tesc;
-    if (*p == '"') p = quoted(p, &tlen, &tesc); else { const char *s0 = p; while (*p != ',') p++; tlen = (uint32_t)(p - s0); }
+    uint32_t tl, tp; if (*p == '"') p = quoted(p, &tl, &tp); else { const char *s0 = p; while (*p != ',') p++; tl = (uint32_t)(p - s0); }
     p++;
     uint32_t reg = 0; while (*p != ',') reg = reg * 10 + (uint32_t)(*p++ - '0'); p++;
-    int neg = 0; if (*p == '-') { neg = 1; p++; }
+    int neg = *p == '-'; p += neg;
     int64_t a = 0; while (*p != '.') a = a * 10 + (*p++ - '0'); a = a * 100 + (p[1] - '0') * 10 + (p[2] - '0'); p += 3; if (neg) a = -a;
-    if (*p == '\r') p++; p++;
+    p += (*p == '\r') + 1;
     int g = (reg < MAXREG && regc[reg]) ? regc[reg] - 1 : NC;
-    Agg *A = &t->agg[g]; A->count++; A->idsum += id; A->asum += a; if (a < A->amin) A->amin = a; if (a > A->amax) A->amax = a; A->nbytes += nlen; A->tbytes += tlen;
-    const char *key = nraw; uint32_t klen = nlen;
-    if (esc) { uint32_t k = 0; for (uint32_t i = 0; i < nrawlen; i++) { ubuf[k++] = nraw[i]; if (nraw[i] == '"') i++; } key = ubuf; klen = k; }
-    uint32_t lid = intern(t, key, klen);
-    if (t->np == t->pcap) { t->pcap = t->pcap ? t->pcap * 2 : 1 << 18; t->pair = realloc(t->pair, 4 * t->pcap); }
-    t->pair[t->np++] = (lid << 8) | (uint32_t)g;
+    Agg *x = &A[g]; x->count++; x->idsum += id; x->asum += a; if (a < x->amin) x->amin = a; if (a > x->amax) x->amax = a; x->nbytes += nl; x->tbytes += tl;
+    const char *k = ns;
+    if (np) { uint32_t m = 0; for (uint32_t i = 0; m < nl; i++) { ub[m++] = ns[i]; i += ns[i] == '"'; } k = ub; }
+    uint32_t slot = intern(k, nl);
+    uint64_t *w = &bits[((size_t)g << (TB - 6)) + (slot >> 6)], b = 1ull << (slot & 63);
+    if (!(*w & b)) __atomic_fetch_or(w, b, __ATOMIC_RELAXED);
   }
   return NULL;
 }
-
-static size_t WORDS; static uint64_t *BITS;
-static void *mark(void *arg) { Th *t = arg;
-  for (size_t j = 0; j < t->np; j++) { uint32_t g = t->pair[j] & 255, gid = t->map[t->pair[j] >> 8];
-    uint64_t *w = &BITS[(size_t)g * WORDS + gid / 64], b = 1ull << (gid % 64); if (!(*w & b)) __atomic_fetch_or(w, b, __ATOMIC_RELAXED); }
-  return NULL; }
-
 static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONLY); if (fd < 0) { perror(path); exit(1); }
-  struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; if (!*sz) return NULL;
-  char *p = mmap(NULL, *sz + 4096, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0); close(fd); return p; }
-
+  struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; char *p = mmap(NULL, *sz + 4096, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); return p; }
 static int codecmp(const void *a, const void *b) { return memcmp(a, b, 3); }
-
-static char *money(char *w, int64_t c) { if (c < 0) { *w++ = '-'; c = -c; } int64_t ip = c / 100; int f = (int)(c % 100);
-  char b[24]; int n = 0; do { b[n++] = (char)('0' + ip % 10); ip /= 10; } while (ip); while (n) *w++ = b[--n]; *w++ = '.'; *w++ = (char)('0' + f / 10); *w++ = (char)('0' + f % 10); return w; }
 static char *num(char *w, int64_t v) { char b[24]; int n = 0; do { b[n++] = (char)('0' + v % 10); v /= 10; } while (v); while (n) *w++ = b[--n]; return w; }
-
+static char *money(char *w, int64_t c) { if (c < 0) { *w++ = '-'; c = -c; } w = num(w, c / 100); *w++ = '.'; *w++ = (char)('0' + c % 100 / 10); *w++ = (char)('0' + c % 10); return w; }
 int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
-  /* regions */
   size_t rs; snprintf(path, sizeof path, "%s/regions.csv", data); const char *R = mapfile(path, &rs);
   const char *p = memchr(R, '\n', rs) + 1, *re = R + rs;
-  char (*tmp)[4] = malloc(4 * 300000); int nr = 0;
+  for (const char *q = p + 1; q < re; q = memchr(q, '\n', (size_t)(re - q)) + 1) { const char *c = memchr(q, ',', 16) + 1;   /* collect codes */
+    if (!bsearch(c, codes, (size_t)NC, 4, codecmp)) { memcpy(codes[NC++], c, 3); qsort(codes, (size_t)NC, 4, codecmp); } }
   regc = calloc(MAXREG, 1);
-  /* pass 1: collect codes */
-  for (const char *q = p; q < re;) { while (*q != ',') q++; q++; memcpy(tmp[nr], q, 3); tmp[nr][3] = 0; nr++; q += 4; }
-  qsort(tmp, (size_t)nr, 4, codecmp);
-  NC = 0; for (int i = 0; i < nr; i++) if (!NC || memcmp(codes[NC - 1], tmp[i], 3)) { memcpy(codes[NC], tmp[i], 4); NC++; }
-  for (const char *q = p; q < re;) { uint32_t id = 0; while (*q != ',') id = id * 10 + (uint32_t)(*q++ - '0'); q++;
-    char (*f)[4] = bsearch(q, codes, (size_t)NC, 4, codecmp); regc[id] = (uint8_t)((f - codes) + 1); q += 4; }
-  /* records */
+  for (const char *q = p; q < re; q += 4) { uint32_t id = 0; while (*q != ',') id = id * 10 + (uint32_t)(*q++ - '0'); q++;
+    regc[id] = (uint8_t)((char (*)[4])bsearch(q, codes, (size_t)NC, 4, codecmp) - codes + 1); }
   snprintf(path, sizeof path, "%s/records.csv", data); F = mapfile(path, &FS);
-  p = F; if ((uint8_t)p[0] == 0xEF) p += 3; p = memchr(p, '\n', FS) + 1; size_t body = (size_t)(p - F);
-  long nt = sysconf(_SC_NPROCESSORS_ONLN); if (nt < 1) nt = 1; if (nt > NT_MAX) nt = NT_MAX;
-  Th *th = calloc((size_t)nt, sizeof(Th)); pthread_t pt[NT_MAX];
-  /* split: a record starts right after an LF that is followed by a digit or a BOM (2.2: notes are lowercase words,
-     an LF inside a note is always followed by a letter or a quote, never a digit or 0xEF) */
-  size_t prev = body;
-  for (long i = 0; i < nt; i++) {
-    size_t c = (i == nt - 1) ? FS : body + (FS - body) * (size_t)(i + 1) / (size_t)nt;
-    if (c < prev) c = prev;
-    while (c < FS) { if (F[c - 1] == '\n' && ((F[c] >= '0' && F[c] <= '9') || (uint8_t)F[c] == 0xEF)) break; c++; }
-    th[i].beg = prev; th[i].end = c; prev = c;
-  }
-  for (long i = 0; i < nt; i++) pthread_create(&pt[i], NULL, work, &th[i]);
-  for (long i = 0; i < nt; i++) pthread_join(pt[i], NULL);
-  /* merge names: one global hash of every thread's names (hashes already computed), then mark bits in parallel */
-  size_t tot = 0; for (long i = 0; i < nt; i++) tot += th[i].nnm;
-  size_t gcap = 1; while (gcap < tot * 2 + 2) gcap <<= 1;
-  int32_t *gt = malloc(4 * gcap); memset(gt, -1, 4 * gcap); Nm *gn = malloc(sizeof(Nm) * (tot + 1)); uint32_t NU = 0;
-  for (long i = 0; i < nt; i++) { Th *t = &th[i]; t->map = malloc(4 * (t->nnm + 1));
-    for (uint32_t j = 0; j < t->nnm; j++) { Nm *n = &t->nm[j]; size_t q = n->hash & (gcap - 1);
-      for (;;) { int32_t g = gt[q]; if (g < 0) { gt[q] = (int32_t)NU; gn[NU] = *n; t->map[j] = NU++; break; }
-        if (gn[g].hash == n->hash && gn[g].len == n->len && memcmp(gn[g].s, n->s, n->len) == 0) { t->map[j] = (uint32_t)g; break; }
-        q = (q + 1) & (gcap - 1); } } }
-  WORDS = (NU + 63) / 64; BITS = calloc(WORDS * (size_t)(NC + 1), 8);
-  for (long i = 0; i < nt; i++) pthread_create(&pt[i], NULL, mark, &th[i]);
-  for (long i = 0; i < nt; i++) pthread_join(pt[i], NULL);
-  size_t words = WORDS; uint64_t *bits = BITS;
-  Agg G[257]; for (int g = 0; g <= NC; g++) { G[g] = (Agg){0, 0, 0, INT64_MAX, INT64_MIN, 0, 0}; }
-  for (long i = 0; i < nt; i++) { Th *t = &th[i];
-    for (int g = 0; g <= NC; g++) { Agg *a = &t->agg[g]; if (!a->count) continue; G[g].count += a->count; G[g].idsum += a->idsum; G[g].asum += a->asum;
-      if (a->amin < G[g].amin) G[g].amin = a->amin; if (a->amax > G[g].amax) G[g].amax = a->amax; G[g].nbytes += a->nbytes; G[g].tbytes += a->tbytes; } }
-  char *buf = malloc(256 * 300), *w = buf;
-  for (int g = 0; g <= NC; g++) { if (!G[g].count) continue;
-    int64_t nd = 0; for (size_t x = 0; x < words; x++) nd += __builtin_popcountll(bits[(size_t)g * words + x]);
+  p = memchr(F, '\n', FS) + 1; size_t body = (size_t)(p - F);
+  long nt = sysconf(_SC_NPROCESSORS_ONLN); NT = nt < 1 ? 1 : nt > NT_MAX ? NT_MAX : (int)nt;
+  /* a record starts right after an LF followed by a digit or a BOM; by spec 2.2 an LF inside a note never is */
+  cut[0] = body; cut[NT] = FS;
+  for (int i = 1; i < NT; i++) { size_t c = body + (FS - body) * (size_t)i / (size_t)NT; if (c < cut[i - 1]) c = cut[i - 1];
+    while (c < FS && !(F[c - 1] == '\n' && ((F[c] >= '0' && F[c] <= '9') || (uint8_t)F[c] == 0xEF))) c++; cut[i] = c; }
+  tab = calloc(TS, 8); arena = malloc(1 << 24); bits = calloc((size_t)(NC + 1) << (TB - 6), 8);
+  pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, work, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
+  char buf[257 * 200], *w = buf;
+  for (int g = 0; g <= NC; g++) {
+    Agg G = {0, 0, 0, INT64_MAX, INT64_MIN, 0, 0};
+    for (int i = 0; i < NT; i++) { Agg *a = &agg[i][g]; G.count += a->count; G.idsum += a->idsum; G.asum += a->asum; G.nbytes += a->nbytes; G.tbytes += a->tbytes;
+      if (a->amin < G.amin) G.amin = a->amin; if (a->amax > G.amax) G.amax = a->amax; }
+    if (!G.count) continue;
+    int64_t nd = 0; for (size_t x = 0; x < (TS >> 6); x++) nd += __builtin_popcountll(bits[((size_t)g << (TB - 6)) + x]);
     if (g < NC) { memcpy(w, codes[g], 3); w += 3; } else { memcpy(w, "_UNMATCHED", 10); w += 10; }
-    *w++ = ' '; w = num(w, G[g].count); *w++ = ' '; w = num(w, G[g].idsum); *w++ = ' '; w = money(w, G[g].asum); *w++ = ' ';
-    w = money(w, G[g].amin); *w++ = ' '; w = money(w, G[g].amax); *w++ = ' '; w = num(w, nd); *w++ = ' '; w = num(w, G[g].nbytes); *w++ = ' '; w = num(w, G[g].tbytes); *w++ = '\n'; }
+    *w++ = ' '; w = num(w, G.count); *w++ = ' '; w = num(w, G.idsum); *w++ = ' '; w = money(w, G.asum); *w++ = ' '; w = money(w, G.amin); *w++ = ' ';
+    w = money(w, G.amax); *w++ = ' '; w = num(w, nd); *w++ = ' '; w = num(w, G.nbytes); *w++ = ' '; w = num(w, G.tbytes); *w++ = '\n'; }
   snprintf(path, sizeof path, "%s/aggregates.txt", out); FILE *f = fopen(path, "wb"); if (!f) { perror("fopen"); return 1; }
   fwrite(buf, 1, (size_t)(w - buf), f); fclose(f); return 0;
 }

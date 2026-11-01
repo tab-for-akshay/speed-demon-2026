@@ -1,6 +1,6 @@
 # Track D: performance log
 
-Every number below is from the live board (i5-13500, 6 P-cores, turbo off), read from board.json. M is the kernel's peak memory in MB (10^6 bytes), S is scc lines.
+Every number below is from the live board (i5-13500, 6 P-cores, turbo off), read from board.json. M is the kernel's peak memory in MB (10^6 bytes), S is the code lines scc counts after clang-format (LLVM style).
 
 | Step | Change | Commit | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|---|---|
@@ -9,6 +9,7 @@ Every number below is from the live board (i5-13500, 6 P-cores, turbo off), read
 | 1 (re-run) | Same step-1 code, measured again on a later push | ce2fcae | run-c0a9e0ff7719 | 1.736 | 388.8 | 293 | 5.73 | 37.9 |
 | 2 (experiment, lost) | Bidirectional Dijkstra (forward on the graph, backward on a reverse CSR built in the same parallel pass), stop when topF + topB >= best; per-node query stamps (settled = top bit) replace clearing | 99c823a | run-acfbc4a96be2 | 1.327 | 936.1 | 326 | 5.41 | 36.7 |
 | 3 (experiment, lost) | Same search; drop the two stamp arrays per thread: distances reset through touched lists, settled flags in a bitset (less memory per thread) | e26d36d | run-0dd99818d47a | 1.433 | 706.8 | 354 | 5.44 | 36.8 |
+| 4 | 32-bit distances (UINT32_MAX = unreached; a query whose distance would pass 2^32 - 1 is redone exactly in 64 bits), no "done" array (stale heap entries skipped), answer `-1` at once when `t` has no in-edges (that query used to flood all 1.74M nodes), parse twice straight into the CSR (count, then scatter) instead of keeping edge arrays, relabel nodes in BFS order so a search touches nearby memory | 26e8cf3 | run-71fbb3125598 | 0.571 | 222.6 | 386 | 10.72 | 51.5 |
 
 ## Experiments that lost
 
