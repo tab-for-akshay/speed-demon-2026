@@ -1,7 +1,7 @@
 // Speed Demon 2026 Track D (Traverse) - C solution.
 // Built by Tab, an AI assistant, for team lead Akshay Wagh.
 // Parallel parse -> forward and reverse CSR -> one bidirectional Dijkstra per query,
-// queries spread over all hardware threads; per-node query stamps replace clearing.
+// queries spread over all hardware threads; touched lists reset only what a query changed.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
@@ -53,31 +53,35 @@ static inline HE hpop(HE *h, size_t *hn) {
 static void *solve(void *arg) {
   (void)arg;
   uint64_t *df = malloc(8 * (size_t)N), *db = malloc(8 * (size_t)N);
-  uint32_t *sf = calloc(N, 4), *sb = calloc(N, 4);   /* stamp: query id + 1 = dist valid; with the top bit = settled */
+  uint64_t *xf = calloc((N + 63) / 64, 8), *xb = calloc((N + 63) / 64, 8);   /* settled bitsets */
+  size_t tcf = 1 << 14, tcb = 1 << 14, ntf = 0, ntb = 0; uint32_t *tf = malloc(4 * tcf), *tb = malloc(4 * tcb);  /* touched lists */
+  memset(df, 0xff, 8 * (size_t)N); memset(db, 0xff, 8 * (size_t)N);
   size_t cf = 1 << 14, cb = 1 << 14; HE *hf = malloc(sizeof(HE) * cf), *hb = malloc(sizeof(HE) * cb);
   for (;;) {
     uint32_t qi = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (qi >= Q) break;
-    uint32_t s = qs[qi], t = qt[qi], st = qi + 1, ss = st | 0x80000000u;
+    uint32_t s = qs[qi], t = qt[qi];
     if (s == t) { ans[qi] = 0; continue; }
     if (off[s] == off[s + 1] || roff[t] == roff[t + 1]) { ans[qi] = -1; continue; }
     uint64_t best = UINT64_MAX; size_t nf = 0, nb = 0;
-    df[s] = 0; sf[s] = st; hpush(&hf, &nf, &cf, 0, s);
-    db[t] = 0; sb[t] = st; hpush(&hb, &nb, &cb, 0, t);
+    df[s] = 0; tf[ntf++] = s; hpush(&hf, &nf, &cf, 0, s);
+    db[t] = 0; tb[ntb++] = t; hpush(&hb, &nb, &cb, 0, t);
     while (nf && nb) {
       if (hf[0].d + hb[0].d >= best) break;
       if (hf[0].d <= hb[0].d) {
-        HE e = hpop(hf, &nf); uint32_t u = e.v; if (sf[u] == ss || e.d > df[u]) continue; sf[u] = ss;
+        HE e = hpop(hf, &nf); uint32_t u = e.v; if ((xf[u >> 6] >> (u & 63)) & 1 || e.d > df[u]) continue; xf[u >> 6] |= 1ull << (u & 63);
         for (uint32_t k = off[u], ke = off[u + 1]; k < ke; k++) { uint32_t v = adjv[k]; uint64_t nd = e.d + adjw[k];
-          if ((sf[v] & 0x7fffffffu) != st || (sf[v] == st && nd < df[v])) { df[v] = nd; sf[v] = st; hpush(&hf, &nf, &cf, nd, v);
-            if ((sb[v] & 0x7fffffffu) == st && nd + db[v] < best) best = nd + db[v]; } }
+          if (nd < df[v]) { if (df[v] == UINT64_MAX) { if (ntf == tcf) { tcf *= 2; tf = realloc(tf, 4 * tcf); } tf[ntf++] = v; } df[v] = nd; hpush(&hf, &nf, &cf, nd, v);
+            if (db[v] != UINT64_MAX && nd + db[v] < best) best = nd + db[v]; } }
       } else {
-        HE e = hpop(hb, &nb); uint32_t u = e.v; if (sb[u] == ss || e.d > db[u]) continue; sb[u] = ss;
+        HE e = hpop(hb, &nb); uint32_t u = e.v; if ((xb[u >> 6] >> (u & 63)) & 1 || e.d > db[u]) continue; xb[u >> 6] |= 1ull << (u & 63);
         for (uint32_t k = roff[u], ke = roff[u + 1]; k < ke; k++) { uint32_t v = radjv[k]; uint64_t nd = e.d + radjw[k];
-          if ((sb[v] & 0x7fffffffu) != st || (sb[v] == st && nd < db[v])) { db[v] = nd; sb[v] = st; hpush(&hb, &nb, &cb, nd, v);
-            if ((sf[v] & 0x7fffffffu) == st && nd + df[v] < best) best = nd + df[v]; } }
+          if (nd < db[v]) { if (db[v] == UINT64_MAX) { if (ntb == tcb) { tcb *= 2; tb = realloc(tb, 4 * tcb); } tb[ntb++] = v; } db[v] = nd; hpush(&hb, &nb, &cb, nd, v);
+            if (df[v] != UINT64_MAX && nd + df[v] < best) best = nd + df[v]; } }
       }
     }
     ans[qi] = best == UINT64_MAX ? -1 : (int64_t)best;
+    for (size_t k = 0; k < ntf; k++) { uint32_t v = tf[k]; df[v] = UINT64_MAX; xf[v >> 6] = 0; } ntf = 0;
+    for (size_t k = 0; k < ntb; k++) { uint32_t v = tb[k]; db[v] = UINT64_MAX; xb[v >> 6] = 0; } ntb = 0;
   }
   return NULL;
 }
