@@ -164,16 +164,6 @@ static void *outworker(void *arg) {
   free(tmp); return NULL;
 }
 
-/* parallel merge: per-line global group key, counts and error counts with atomic adds, then a parallel scatter */
-static void *G_TH; static uint32_t **G_MAP; static uint32_t G_NE; static uint32_t *G_FILL;
-static void *count_pass(void *arg) { Th *t = arg; long i = t - (Th *)G_TH; uint32_t *mp = G_MAP[i];
-  for (size_t j = 0; j < t->n; j++) { uint32_t kk = t->key[j]; uint32_t g = (kk >> 12) * G_NE + mp[kk & 4095]; t->key[j] = g;
-    __atomic_fetch_add(&gcount[g], 1, __ATOMIC_RELAXED); if (t->err[j]) __atomic_fetch_add(&gerr[g], 1, __ATOMIC_RELAXED); }
-  free(t->err); return NULL; }
-static void *scatter_pass(void *arg) { Th *t = arg;
-  for (size_t j = 0; j < t->n; j++) { uint32_t p = __atomic_fetch_add(&G_FILL[t->key[j]], 1, __ATOMIC_RELAXED); all[p] = t->lat[j]; }
-  free(t->key); free(t->lat); return NULL; }
-
 int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out";
   char path[4096]; snprintf(path, sizeof path, "%s/requests.log", data);
@@ -211,16 +201,17 @@ int main(int argc, char **argv) {
   }
   size_t NG = (size_t)NH * NE;
   gcount = calloc(NG + 1, 4); goff = calloc(NG + 1, 4); gerr = calloc(NG + 1, 4);
-  G_TH = th; G_MAP = map; G_NE = NE;
-  for (long i = 0; i < nt; i++) pthread_create(&pt[i], NULL, count_pass, &th[i]);
-  for (long i = 0; i < nt; i++) pthread_join(pt[i], NULL);
-  size_t N = 0; for (long i = 0; i < nt; i++) N += th[i].n;
+  size_t N = 0;
+  for (long i = 0; i < nt; i++) { Th *t = &th[i]; N += t->n;
+    for (size_t j = 0; j < t->n; j++) { uint32_t kk = t->key[j]; size_t g = (size_t)(kk >> 12) * NE + map[i][kk & 4095];
+      t->key[j] = (uint32_t)g; gcount[g]++; gerr[g] += t->err[j]; } }
   uint32_t acc = 0; for (size_t g = 0; g < NG; g++) { goff[g] = acc; acc += gcount[g]; }
   all = malloc(4 * (N + 1));
-  G_FILL = malloc(4 * (NG + 1)); memcpy(G_FILL, goff, 4 * NG);
-  for (long i = 0; i < nt; i++) pthread_create(&pt[i], NULL, scatter_pass, &th[i]);
-  for (long i = 0; i < nt; i++) pthread_join(pt[i], NULL);
-  free(G_FILL);
+  uint32_t *fill = malloc(4 * (NG + 1)); memcpy(fill, goff, 4 * NG);
+  for (long i = 0; i < nt; i++) { Th *t = &th[i]; free(t->err);
+    for (size_t j = 0; j < t->n; j++) all[fill[t->key[j]]++] = t->lat[j];
+    free(t->key); free(t->lat); }
+  free(fill);
   for (int h = 0; h < NH; h++) {
     long ah = BASE_H + h; long days = ah / 24; int hh = (int)(ah % 24);
     /* civil_from_days */

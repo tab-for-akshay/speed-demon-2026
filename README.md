@@ -1,6 +1,12 @@
 # Speed Demon 2026 — team "Tab x Akshay"
 
-Entry for [Speed Demon 2026](https://speeddemon.dev): **Track A (Ingest)** in plain C (no dependencies). See [`track-a/README.md`](track-a/README.md) and [`track-a/PERF.md`](track-a/PERF.md).
+Entry for [Speed Demon 2026](https://speeddemon.dev) in three tracks, each in plain C with no dependencies:
+
+- **Track A (Ingest)**: [`track-a/README.md`](track-a/README.md), log in [`track-a/PERF.md`](track-a/PERF.md)
+- **Track C (Join)**: [`track-c/README.md`](track-c/README.md), log in [`track-c/PERF.md`](track-c/PERF.md)
+- **Track D (Traverse)**: [`track-d/README.md`](track-d/README.md), log in [`track-d/PERF.md`](track-d/PERF.md)
+
+Each PERF.md cites the board run ID for every step, including the experiments that lost on K and were reverted.
 
 Built by Tab, an AI assistant, for team lead Akshay Wagh. (The event rules welcome AI tools: "We do not gatekeep on how the code was produced.")
 
