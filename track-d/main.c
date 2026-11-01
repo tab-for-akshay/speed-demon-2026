@@ -1,8 +1,5 @@
 // Speed Demon 2026 Track D (Traverse) - C solution.
 // Built by Tab, an AI assistant, for team lead Akshay Wagh.
-// Parallel parse -> CSR adjacency -> one early-stopping Dijkstra per query,
-// queries spread over all hardware threads, each with its own dist array
-// that is reset through a touched-list (no O(n) clears).
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
@@ -13,102 +10,117 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #define NT_MAX 64
-static uint32_t N, M;
-static uint32_t *off;          /* CSR offsets, N+1 */
-static uint32_t *adjv, *adjw;  /* heads and weights */
-static uint32_t *eu, *ev, *ew; /* edge list */
-static const char *G; static size_t GS;
-static int NT;
-
-static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = 0; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
-
-typedef struct { size_t beg, end; uint32_t first, cnt; } Chunk;
-static Chunk ch[NT_MAX];
-
-static void *count_lines(void *a) { Chunk *c = a; uint32_t k = 0; const char *p = G + c->beg, *e = G + c->end;
-  while (p < e) { const char *q = memchr(p, '\n', (size_t)(e - p)); if (!q) break; k++; p = q + 1; } c->cnt = k; return NULL; }
-static void *parse_edges(void *a) { Chunk *c = a; const char *p = G + c->beg; uint32_t i = c->first, end = c->first + c->cnt;
-  for (; i < end; i++) { uint32_t u = num(&p), v = num(&p), w = num(&p); eu[i] = u; ev[i] = v; ew[i] = w; __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); }
-  return NULL; }
-static uint32_t *pos;
-static void *fill_csr(void *a) { Chunk *c = a; for (uint32_t i = c->first; i < c->first + c->cnt; i++) {
-    uint32_t p = __atomic_fetch_add(&pos[eu[i]], 1, __ATOMIC_RELAXED); adjv[p] = ev[i]; adjw[p] = ew[i]; } return NULL; }
-
-static uint32_t Q; static uint32_t *qs, *qt; static int64_t *ans;
-static volatile uint32_t qnext;
-
-typedef struct { uint64_t d; uint32_t v; } HE;
-static void *solve(void *arg) {
-  (void)arg;
-  uint64_t *dist = malloc(sizeof(uint64_t) * N); memset(dist, 0xff, sizeof(uint64_t) * N);
-  uint8_t *done = calloc(N, 1);
-  uint32_t *touched = malloc(sizeof(uint32_t) * N); size_t nt = 0;
-  size_t hcap = 1 << 16; HE *h = malloc(sizeof(HE) * hcap);
-  for (;;) {
-    uint32_t qi = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (qi >= Q) break;
-    uint32_t s = qs[qi], t = qt[qi];
-    if (s == t) { ans[qi] = 0; continue; }
-    int64_t res = -1; size_t hn = 0;
-    dist[s] = 0; touched[nt++] = s; h[hn++] = (HE){0, s};
-    while (hn) {
-      HE top = h[0]; HE last = h[--hn];
-      if (hn) { size_t i = 0; for (;;) { size_t l = 2 * i + 1; if (l >= hn) break; size_t r = l + 1, m = (r < hn && h[r].d < h[l].d) ? r : l; if (h[m].d >= last.d) break; h[i] = h[m]; i = m; } h[i] = last; }
-      uint32_t u = top.v; if (done[u]) continue; if (top.d > dist[u]) continue;
-      done[u] = 1;
-      if (u == t) { res = (int64_t)top.d; break; }
-      uint64_t du = top.d;
-      for (uint32_t e = off[u]; e < off[u + 1]; e++) {
-        uint32_t v = adjv[e]; uint64_t nd = du + adjw[e];
-        if (nd < dist[v]) {
-          if (dist[v] == UINT64_MAX) touched[nt++] = v;
-          dist[v] = nd;
-          if (hn == hcap) { hcap *= 2; h = realloc(h, sizeof(HE) * hcap); }
-          size_t i = hn++; while (i) { size_t p = (i - 1) / 2; if (h[p].d <= nd) break; h[i] = h[p]; i = p; } h[i] = (HE){nd, v};
-        }
-      }
+typedef struct { uint32_t v, w; } E;
+static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static E *adj; static int64_t *ans;
+static const char *G; static size_t GS; static int NT; static uint32_t qnext;
+static size_t cb[NT_MAX + 1];
+static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
+static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
+static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
+  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
+static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
+  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
+/* Dijkstra with 32-bit distances; returns -2 if a distance would not fit (redone in 64 bits) */
+static int64_t search(uint32_t s, uint32_t t, uint32_t *dist, uint32_t **tp, size_t *tc, uint64_t **hp, size_t *hc) {
+  uint32_t *tch = *tp; uint64_t *h = *hp; size_t nt = 0, hn = 0; int64_t res = -1;
+  dist[s] = 0; tch[nt++] = s; h[hn++] = s;
+  while (hn) {
+    uint64_t top = h[0], last = h[--hn]; size_t i = 0;
+    for (;;) { size_t l = 2 * i + 1; if (l >= hn) break; size_t m = (l + 1 < hn && h[l + 1] < h[l]) ? l + 1 : l; if (h[m] >= last) break; h[i] = h[m]; i = m; }
+    h[i] = last;
+    uint32_t u = (uint32_t)top, du = (uint32_t)(top >> 32);
+    if (du > dist[u]) continue;
+    if (u == t) { res = du; break; }
+    for (uint32_t e = off[u]; e < off[u + 1]; e++) {
+      uint64_t nd = (uint64_t)du + adj[e].w; uint32_t v = adj[e].v;
+      if (nd >= UINT32_MAX) { res = -2; goto out; }
+      if (nd >= dist[v]) continue;
+      if (dist[v] == UINT32_MAX) { if (nt == *tc) { *tc *= 2; *tp = tch = realloc(tch, *tc * 4); } tch[nt++] = v; }
+      dist[v] = (uint32_t)nd;
+      if (hn == *hc) { *hc *= 2; *hp = h = realloc(h, *hc * 8); }
+      size_t j = hn++; uint64_t key = nd << 32 | v;
+      while (j) { size_t p = (j - 1) / 2; if (h[p] <= key) break; h[j] = h[p]; j = p; } h[j] = key;
     }
-    ans[qi] = res;
-    for (size_t i = 0; i < nt; i++) { dist[touched[i]] = UINT64_MAX; done[touched[i]] = 0; } nt = 0;
   }
-  free(dist); free(done); free(touched); free(h); return NULL;
+out:
+  for (size_t i = 0; i < nt; i++) dist[tch[i]] = UINT32_MAX;
+  return res;
 }
 
+/* relabel nodes in BFS order so that a search touches nearby memory */
+static uint32_t *order, *nid, *noff; static E *nadj;
+static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
+  for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++) nadj[o++] = (E){nid[adj[e].v], adj[e].w}; } return NULL; }
+static void relabel(uint32_t root) {
+  order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
+  uint32_t head = 0, tail = 0, next = 0;
+  for (;;) {
+    if (head == tail) { while (next < N && nid[next] != UINT32_MAX) next++; if (next == N) break; if (tail == 0) next = root; nid[next] = tail; order[tail++] = next; }
+    uint32_t u = order[head++]; if (head + 8 < tail) __builtin_prefetch(&adj[off[order[head + 8]]]);
+    for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; __builtin_prefetch(&off[v]); } }
+  }
+  noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
+  for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
+  nadj = malloc(sizeof(E) * ((size_t)off[N] + 1));
+  run(pass3);
+  free(adj); free(off); free(order); adj = nadj; off = noff;
+}
+static void *solve(void *a) {
+  (void)a; uint32_t *dist = malloc(4 * (size_t)N); memset(dist, 0xff, 4 * (size_t)N);
+  size_t tc = 1 << 16, hc = 1 << 16; uint32_t *tch = malloc(tc * 4); uint64_t *h = malloc(hc * 8);
+  for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break;
+    uint32_t s = qs[i], t = qt[i];
+    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : search(s, t, dist, &tch, &tc, &h, &hc); }
+  free(dist); free(tch); free(h); return NULL;
+}
+/* exact 64-bit Dijkstra for the few queries whose distances pass 2^32 - 1 */
+static int64_t search64(uint32_t s, uint32_t t, uint64_t *dist) {
+  typedef struct { uint64_t d; uint32_t v; } H; size_t hc = 1 << 16, hn = 0; H *h = malloc(hc * sizeof(H)); int64_t res = -1;
+  uint32_t *tch = malloc(4 * (size_t)N); size_t nt = 0;
+  dist[s] = 0; tch[nt++] = s; h[hn++] = (H){0, s};
+  while (hn) {
+    H top = h[0], last = h[--hn]; size_t i = 0;
+    for (;;) { size_t l = 2 * i + 1; if (l >= hn) break; size_t m = (l + 1 < hn && h[l + 1].d < h[l].d) ? l + 1 : l; if (h[m].d >= last.d) break; h[i] = h[m]; i = m; }
+    h[i] = last;
+    if (top.d > dist[top.v]) continue;
+    if (top.v == t) { res = (int64_t)top.d; break; }
+    for (uint32_t e = off[top.v]; e < off[top.v + 1]; e++) {
+      uint64_t nd = top.d + adj[e].w; uint32_t v = adj[e].v; if (nd >= dist[v]) continue;
+      if (dist[v] == UINT64_MAX) tch[nt++] = v;
+      dist[v] = nd; if (hn == hc) { hc *= 2; h = realloc(h, hc * sizeof(H)); }
+      size_t j = hn++; while (j) { size_t p = (j - 1) / 2; if (h[p].d <= nd) break; h[j] = h[p]; j = p; } h[j] = (H){nd, v};
+    }
+  }
+  for (size_t i = 0; i < nt; i++) dist[tch[i]] = UINT64_MAX;
+  free(h); free(tch); return res;
+}
 static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONLY); if (fd < 0) { perror(path); exit(1); }
-  struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; if (!*sz) return NULL;
-  char *p = mmap(NULL, *sz, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0); close(fd); return p; }
-
+  struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; char *p = *sz ? mmap(NULL, *sz, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0) : NULL; close(fd); return p; }
 int main(int argc, char **argv) {
-  const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out";
-  char path[4096];
-  long nt = sysconf(_SC_NPROCESSORS_ONLN); if (nt < 1) nt = 1; if (nt > NT_MAX) nt = NT_MAX; NT = (int)nt;
+  const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
+  long nt = sysconf(_SC_NPROCESSORS_ONLN); NT = nt < 1 ? 1 : nt > NT_MAX ? NT_MAX : (int)nt;
   snprintf(path, sizeof path, "%s/graph.txt", data); G = mapfile(path, &GS);
-  const char *p = G; N = num(&p); M = num(&p); size_t body = (size_t)(p - G);
-  /* chunk at newline boundaries */
-  size_t span = GS - body; size_t prev = body;
-  for (int i = 0; i < NT; i++) { size_t e = (i == NT - 1) ? GS : body + span * (size_t)(i + 1) / (size_t)NT;
-    if (e < prev) e = prev; while (e < GS && e > prev && G[e - 1] != '\n') e++; ch[i].beg = prev; ch[i].end = e; prev = e; }
-  pthread_t th[NT_MAX];
-  for (int i = 0; i < NT; i++) pthread_create(&th[i], NULL, count_lines, &ch[i]);
-  for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
-  uint32_t acc = 0; for (int i = 0; i < NT; i++) { ch[i].first = acc; acc += ch[i].cnt; }
-  M = acc;
-  off = calloc((size_t)N + 2, 4); eu = malloc(4 * (size_t)M + 4); ev = malloc(4 * (size_t)M + 4); ew = malloc(4 * (size_t)M + 4);
-  for (int i = 0; i < NT; i++) pthread_create(&th[i], NULL, parse_edges, &ch[i]);
-  for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
+  const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
+  cb[0] = body; cb[NT] = GS;
+  for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
+  off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
+  run(pass1);
   for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
-  pos = malloc(4 * ((size_t)N + 1)); memcpy(pos, off, 4 * ((size_t)N + 1));
-  adjv = malloc(4 * (size_t)M + 4); adjw = malloc(4 * (size_t)M + 4);
-  for (int i = 0; i < NT; i++) pthread_create(&th[i], NULL, fill_csr, &ch[i]);
-  for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
-  free(eu); free(ev); free(ew); free(pos); munmap((void *)G, GS);
+  adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
+  run(pass2);   /* leaves off[u] = end of u = start of u+1: shift back */
+  memmove(off + 1, off, 4 * (size_t)N); off[0] = 0;
   size_t qsz; snprintf(path, sizeof path, "%s/queries.txt", data); const char *qf = mapfile(path, &qsz);
-  Q = 0; for (size_t i = 0; i < qsz; i++) Q += (qf[i] == '\n');
+  Q = 0; for (size_t i = 0; i < qsz; i++) Q += qf[i] == '\n';
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
   p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
-  for (int i = 0; i < NT; i++) pthread_create(&th[i], NULL, solve, NULL);
-  for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
+  { uint32_t r = 0; while (off[r] == off[r + 1]) r++; relabel(r); }
+  { uint8_t *h2 = calloc(N, 1); for (uint32_t i = 0; i < N; i++) h2[nid[i]] = hasin[i]; free(hasin); hasin = h2; }
+  for (uint32_t i = 0; i < Q; i++) { qs[i] = nid[qs[i]]; qt[i] = nid[qt[i]]; }
+  free(nid);
+  run(solve);
+  uint64_t *d64 = NULL;
+  for (uint32_t i = 0; i < Q; i++) if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); }
   snprintf(path, sizeof path, "%s/distances.txt", out);
   FILE *f = fopen(path, "wb"); if (!f) { perror("fopen"); return 1; }
   char *buf = malloc((size_t)Q * 24 + 1), *w = buf;
