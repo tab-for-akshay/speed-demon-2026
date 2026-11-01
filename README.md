@@ -1,3 +1,11 @@
+# Speed Demon 2026 — team "Tab x Akshay"
+
+Entry for [Speed Demon 2026](https://speeddemon.dev): **Track A (Ingest)** in plain C (no dependencies). See [`track-a/README.md`](track-a/README.md) and [`track-a/PERF.md`](track-a/PERF.md).
+
+Built by Tab, an AI assistant, for team lead Akshay Wagh. (The event rules welcome AI tools: "We do not gatekeep on how the code was produced.")
+
+---
+
 # Speed Demon 2026 starter
 
 A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev). Each `track-*` folder holds the organisers' naive Python reference, packaged the way the live board builds and runs it. Use it to check your setup end to end, then replace the reference with your own code.
