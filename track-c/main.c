@@ -26,6 +26,7 @@ typedef struct {
   Nm *nm; int32_t *tab; uint32_t nnm, tcap;  /* name interning (unescaped) */
   char *arena; size_t aused, acap;
   uint32_t *pair; size_t np, pcap;           /* (local name id << 8) | group */
+  uint32_t *map;                             /* local name id -> global name id */
 } Th;
 
 static uint32_t intern(Th *t, const char *s, uint32_t len) {
@@ -80,12 +81,16 @@ static void *work(void *arg) {
   return NULL;
 }
 
+static size_t WORDS; static uint64_t *BITS;
+static void *mark(void *arg) { Th *t = arg;
+  for (size_t j = 0; j < t->np; j++) { uint32_t g = t->pair[j] & 255, gid = t->map[t->pair[j] >> 8];
+    uint64_t *w = &BITS[(size_t)g * WORDS + gid / 64], b = 1ull << (gid % 64); if (!(*w & b)) __atomic_fetch_or(w, b, __ATOMIC_RELAXED); }
+  return NULL; }
+
 static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONLY); if (fd < 0) { perror(path); exit(1); }
   struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; if (!*sz) return NULL;
   char *p = mmap(NULL, *sz + 4096, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0); close(fd); return p; }
 
-typedef struct { const char *s; uint32_t len; } GN;
-static int gncmp(const void *a, const void *b) { const GN *x = a, *y = b; uint32_t n = x->len < y->len ? x->len : y->len; int c = memcmp(x->s, y->s, n); return c ? c : (int)x->len - (int)y->len; }
 static int codecmp(const void *a, const void *b) { return memcmp(a, b, 3); }
 
 static char *money(char *w, int64_t c) { if (c < 0) { *w++ = '-'; c = -c; } int64_t ip = c / 100; int f = (int)(c % 100);
@@ -121,22 +126,23 @@ int main(int argc, char **argv) {
   }
   for (long i = 0; i < nt; i++) pthread_create(&pt[i], NULL, work, &th[i]);
   for (long i = 0; i < nt; i++) pthread_join(pt[i], NULL);
-  /* merge names */
+  /* merge names: one global hash of every thread's names (hashes already computed), then mark bits in parallel */
   size_t tot = 0; for (long i = 0; i < nt; i++) tot += th[i].nnm;
-  GN *all = malloc(sizeof(GN) * (tot + 1)); size_t k = 0;
-  for (long i = 0; i < nt; i++) for (uint32_t j = 0; j < th[i].nnm; j++) all[k++] = (GN){th[i].nm[j].s, th[i].nm[j].len};
-  qsort(all, k, sizeof(GN), gncmp);
-  GN *uq = malloc(sizeof(GN) * (k + 1)); size_t NU = 0; for (size_t i = 0; i < k; i++) if (!NU || gncmp(&uq[NU - 1], &all[i])) uq[NU++] = all[i];
-  size_t words = (NU + 63) / 64; uint64_t *bits = calloc(words * (size_t)(NC + 1), 8);
+  size_t gcap = 1; while (gcap < tot * 2 + 2) gcap <<= 1;
+  int32_t *gt = malloc(4 * gcap); memset(gt, -1, 4 * gcap); Nm *gn = malloc(sizeof(Nm) * (tot + 1)); uint32_t NU = 0;
+  for (long i = 0; i < nt; i++) { Th *t = &th[i]; t->map = malloc(4 * (t->nnm + 1));
+    for (uint32_t j = 0; j < t->nnm; j++) { Nm *n = &t->nm[j]; size_t q = n->hash & (gcap - 1);
+      for (;;) { int32_t g = gt[q]; if (g < 0) { gt[q] = (int32_t)NU; gn[NU] = *n; t->map[j] = NU++; break; }
+        if (gn[g].hash == n->hash && gn[g].len == n->len && memcmp(gn[g].s, n->s, n->len) == 0) { t->map[j] = (uint32_t)g; break; }
+        q = (q + 1) & (gcap - 1); } } }
+  WORDS = (NU + 63) / 64; BITS = calloc(WORDS * (size_t)(NC + 1), 8);
+  for (long i = 0; i < nt; i++) pthread_create(&pt[i], NULL, mark, &th[i]);
+  for (long i = 0; i < nt; i++) pthread_join(pt[i], NULL);
+  size_t words = WORDS; uint64_t *bits = BITS;
   Agg G[257]; for (int g = 0; g <= NC; g++) { G[g] = (Agg){0, 0, 0, INT64_MAX, INT64_MIN, 0, 0}; }
   for (long i = 0; i < nt; i++) { Th *t = &th[i];
-    uint32_t *map = malloc(4 * (t->nnm + 1));
-    for (uint32_t j = 0; j < t->nnm; j++) { GN x = {t->nm[j].s, t->nm[j].len}; GN *f = bsearch(&x, uq, NU, sizeof(GN), gncmp); map[j] = (uint32_t)(f - uq); }
-    for (size_t j = 0; j < t->np; j++) { uint32_t g = t->pair[j] & 255, gid = map[t->pair[j] >> 8]; bits[(size_t)g * words + gid / 64] |= 1ull << (gid % 64); }
     for (int g = 0; g <= NC; g++) { Agg *a = &t->agg[g]; if (!a->count) continue; G[g].count += a->count; G[g].idsum += a->idsum; G[g].asum += a->asum;
-      if (a->amin < G[g].amin) G[g].amin = a->amin; if (a->amax > G[g].amax) G[g].amax = a->amax; G[g].nbytes += a->nbytes; G[g].tbytes += a->tbytes; }
-    free(map);
-  }
+      if (a->amin < G[g].amin) G[g].amin = a->amin; if (a->amax > G[g].amax) G[g].amax = a->amax; G[g].nbytes += a->nbytes; G[g].tbytes += a->tbytes; } }
   char *buf = malloc(256 * 300), *w = buf;
   for (int g = 0; g <= NC; g++) { if (!G[g].count) continue;
     int64_t nd = 0; for (size_t x = 0; x < words; x++) nd += __builtin_popcountll(bits[(size_t)g * words + x]);
