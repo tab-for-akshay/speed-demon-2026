@@ -37,10 +37,15 @@ static void gather(int k) {   /* the threads' escaped weights, sorted by edge po
   qsort(pr, n, 8, pcmp); epos[k] = malloc(4 * (size_t)n + 4); ewt[k] = malloc(4 * (size_t)n + 4); nesc[k] = n;
   for (uint32_t i = 0; i < n; i++) { epos[k][i] = pr[2 * i]; ewt[k][i] = pr[2 * i + 1]; } free(pr);
 }
-static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
-static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p), o = __atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED); adj[o] = pack(i, o, v, w); } return NULL; }
+/* the graph is parsed once: pass 1 keeps each thread's edges (12 bytes each) and counts out-degrees, pass 2 places them */
+typedef struct { uint32_t u, v, w; } Edge;
+static Edge *eb[NT_MAX]; static size_t en[NT_MAX];
+static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; Edge *b = eb[i] = malloc((size_t)(e - p) / 6 * sizeof(Edge) + 16); size_t n = 0;   /* a line is at least 6 bytes; only the pages written count */
+  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); b[n++] = (Edge){u, v, w}; __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; }
+  en[i] = n; return NULL; }
+static void *pass2(void *a) { long i = (long)a;
+  for (size_t k = 0; k < en[i]; k++) { Edge x = eb[i][k]; uint32_t o = __atomic_fetch_add(&off[x.u], 1, __ATOMIC_RELAXED); adj[o] = pack(i, o, x.v, x.w); }
+  free(eb[i]); return NULL; }
 /* radix heap of (distance << 32 | node); keys never drop below the last popped one */
 typedef struct { uint64_t *a[33]; uint32_t n[33], cap[33]; uint32_t last; } RH;
 static inline void rh_push(RH *h, uint64_t x) {
