@@ -14,16 +14,13 @@
 #define NT_MAX 64
 static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
 typedef struct { uint32_t v, w; } E;
-static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static E *adj; static int64_t *ans;
+static uint32_t N, Q, *off, *qs, *qt; static E *adj; static int64_t *ans;
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
-static volatile uint64_t probe_sink;
-static void *probe(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint64_t x = 0;   /* TIMING PROBE: one extra parse of the graph */
-  while (p < e) { x += num(&p); x += num(&p); x += num(&p); } probe_sink += x; return NULL; }
 static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
+  while (p < e) { uint32_t u = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); } return NULL; }
 static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
   while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
 /* radix heap of (distance << 32 | node); keys never drop below the last popped one */
@@ -101,22 +98,26 @@ static void *grow(void *a) {
       if (nid[v] == UINT32_MAX && __atomic_compare_exchange_n(&nid[v], &x, 0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) q[n++] = v; } }
   rn[t] = n; return NULL;
 }
+static uint32_t base[NT_MAX];
+static void *place(void *a) { long t = (long)a;   /* region t becomes labels base[t] ... in its BFS order */
+  for (uint32_t i = 0; i < rn[t]; i++) { order[base[t] + i] = reg[t][i]; nid[reg[t][i]] = base[t] + i; } free(reg[t]); return NULL; }
+static void *degs(void *a) { long t = (long)a;
+  for (uint32_t i = (uint32_t)((uint64_t)N * t / NT); i < (uint64_t)N * (t + 1) / NT; i++) noff[i + 1] = off[order[i] + 1] - off[order[i]]; return NULL; }
 static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
   for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++, o++) cadj[o] = pack(t, o, nid[adj[e].v], adj[e].w); } return NULL; }
 static void relabel(void) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
   run(grow);
-  uint32_t tail = 0;
-  for (int t = 0; t < NT; t++) { for (uint32_t i = 0; i < rn[t]; i++) order[tail + i] = reg[t][i]; tail += rn[t]; free(reg[t]); }
-  for (uint32_t i = 0; i < tail; i++) nid[order[i]] = i;
+  uint32_t tail = 0; for (int t = 0; t < NT; t++) { base[t] = tail; tail += rn[t]; }
+  run(place);
   for (uint32_t next = 0, head = tail; next < N; next++) {   /* what no region reached: small pieces, each in BFS order from its first node */
     if (nid[next] != UINT32_MAX) continue;
     nid[next] = tail; order[tail++] = next;
     for (; head < tail; head++) { uint32_t u = order[head];
       for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; } } }
   }
-  noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
-  for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
+  noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0; run(degs);
+  for (uint32_t i = 0; i < N; i++) noff[i + 1] += noff[i];
   VB = 1; while ((1u << VB) < N) VB++; VM = (1u << VB) - 1; WX = VB >= 32 ? 0 : (uint32_t)((1ull << (32 - VB)) - 1);
   cadj = malloc(4 * ((size_t)off[N] + 1));
   run(pass3); gather(0);
@@ -129,13 +130,13 @@ static void *solve(void *a) {
   F.tc = B.tc = 1 << 16; F.tch = malloc(F.tc * 4); B.tch = malloc(B.tc * 4);
   for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break; i = qord[i];
     uint32_t s = qs[i], t = qt[i];
-    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : bisearch(s, t, &F, &B); }
+    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || roff[t] == roff[t + 1]) ? -1 : bisearch(s, t, &F, &B); }
   free(F.d); free(B.d); free(F.tch); free(B.tch); for (int b = 0; b < 33; b++) { free(F.h.a[b]); free(B.h.a[b]); } return NULL;
 }
 /* exact 64-bit Dijkstra for the few queries whose distances pass 2^32 - 1 */
 static int64_t search64(uint32_t s, uint32_t t, uint64_t *dist) {
   typedef struct { uint64_t d; uint32_t v; } H; size_t hc = 1 << 16, hn = 0; H *h = malloc(hc * sizeof(H)); int64_t res = -1;
-  uint32_t *tch = malloc(4 * (size_t)N); size_t nt = 0;
+  size_t tc = 1 << 16, nt = 0; uint32_t *tch = malloc(4 * tc);
   dist[s] = 0; tch[nt++] = s; h[hn++] = (H){0, s};
   while (hn) {
     H top = h[0], last = h[--hn]; size_t i = 0;
@@ -145,13 +146,19 @@ static int64_t search64(uint32_t s, uint32_t t, uint64_t *dist) {
     if (top.v == t) { res = (int64_t)top.d; break; }
     for (uint32_t e = off[top.v]; e < off[top.v + 1]; e++) {
       uint64_t nd = top.d + wt(0, cadj, e); uint32_t v = cadj[e] & VM; if (nd >= dist[v]) continue;
-      if (dist[v] == UINT64_MAX) tch[nt++] = v;
+      if (dist[v] == UINT64_MAX) { if (nt == tc) tch = realloc(tch, 4 * (tc *= 2)); tch[nt++] = v; }
       dist[v] = nd; if (hn == hc) { hc *= 2; h = realloc(h, hc * sizeof(H)); }
       size_t j = hn++; while (j) { size_t p = (j - 1) / 2; if (h[p].d <= nd) break; h[j] = h[p]; j = p; } h[j] = (H){nd, v};
     }
   }
   for (size_t i = 0; i < nt; i++) dist[tch[i]] = UINT64_MAX;
   free(h); free(tch); return res;
+}
+static void *solve64(void *a) {   /* the few queries whose 32-bit search hit 2^32 - 1, on half the solving threads */
+  (void)a; uint64_t *d64 = NULL;
+  for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break;
+    if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); } }
+  free(d64); return NULL;
 }
 static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONLY); if (fd < 0) { perror(path); exit(1); }
   struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; char *p = *sz ? mmap(NULL, *sz, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0) : NULL; close(fd); return p; }
@@ -162,8 +169,7 @@ int main(int argc, char **argv) {
   const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
   cb[0] = body; cb[NT] = GS;
   for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
-  off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
-  run(probe);
+  off = calloc((size_t)N + 2, 4);
   run(pass1);
   for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
   adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
@@ -177,14 +183,12 @@ int main(int argc, char **argv) {
   roff = calloc((size_t)N + 2, 4); run(rcount);   /* reverse CSR for the backward search */
   for (uint32_t i = 0; i < N; i++) roff[i + 2] += roff[i + 1];
   cradj = malloc(4 * ((size_t)off[N] + 1)); run(rfill); gather(1);
-  { uint8_t *h2 = calloc(N, 1); for (uint32_t i = 0; i < N; i++) h2[nid[i]] = hasin[i]; free(hasin); hasin = h2; }
   for (uint32_t i = 0; i < Q; i++) { qs[i] = nid[qs[i]]; qt[i] = nid[qt[i]]; }
   free(nid);
   qord = malloc(4 * (size_t)Q + 4); for (uint32_t i = 0; i < Q; i++) qord[i] = i;
   qsort(qord, Q, 4, qcmp);   /* queries in source order: threads working at the same time search nearby parts of the graph */
   NT = (NT + 1) / 2; run(solve);   /* one search per physical core: each holds two distance arrays, so memory beats the hyperthreads here */
-  uint64_t *d64 = NULL;
-  for (uint32_t i = 0; i < Q; i++) if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); }
+  qnext = 0; NT = (NT + 1) / 2; run(solve64);
   snprintf(path, sizeof path, "%s/distances.txt", out);
   FILE *f = fopen(path, "wb"); if (!f) { perror("fopen"); return 1; }
   char *buf = malloc((size_t)Q * 24 + 1), *w = buf;
