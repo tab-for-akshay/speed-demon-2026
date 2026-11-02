@@ -61,18 +61,47 @@ out:
   return res;
 }
 
-/* relabel nodes in BFS order so that a search touches nearby memory */
-static uint32_t *order, *nid, *noff; static E *nadj;
+/* relabel nodes in BFS order so that a search touches nearby memory: a level-synchronous parallel BFS,
+   each thread appending what it discovers to its own buffer, the buffers concatenated in thread order per level */
+static uint32_t *order, *nid, *noff, *lbuf[NT_MAX], lcnt[NT_MAX], qlo, qhi, qtail; static E *nadj;
+static volatile int bar_n, bar_sense;
+static void barrier(int *sense) {
+  *sense = !*sense;
+  if (__atomic_add_fetch(&bar_n, 1, __ATOMIC_ACQ_REL) == NT) { bar_n = 0; __atomic_store_n(&bar_sense, *sense, __ATOMIC_RELEASE); }
+  else while (__atomic_load_n(&bar_sense, __ATOMIC_ACQUIRE) != *sense) __builtin_ia32_pause();
+}
+static void *bfs(void *a) {
+  long t = (long)a; int sense = 0; uint32_t *buf = lbuf[t];
+  for (;;) {
+    uint32_t lo = qlo, hi = qhi, n = hi - lo, b = lo + (uint32_t)((uint64_t)n * t / NT), e = lo + (uint32_t)((uint64_t)n * (t + 1) / NT), c = 0;
+    if (n == 0) break;
+    for (uint32_t i = b; i < e; i++) { uint32_t u = order[i]; if (i + 4 < e) __builtin_prefetch(&off[order[i + 4]]);
+      for (uint32_t k = off[u]; k < off[u + 1]; k++) { uint32_t v = adj[k].v, x = UINT32_MAX;
+        if (nid[v] == UINT32_MAX && __atomic_compare_exchange_n(&nid[v], &x, UINT32_MAX - 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) buf[c++] = v; } }
+    lcnt[t] = c; barrier(&sense);
+    uint32_t o = hi; for (long s = 0; s < t; s++) o += lcnt[s];
+    for (uint32_t i = 0; i < c; i++) { order[o + i] = buf[i]; nid[buf[i]] = o + i; }
+    barrier(&sense);
+    if (t == 0) { uint32_t tot = 0; for (long s = 0; s < NT; s++) tot += lcnt[s]; qlo = hi; qhi = hi + tot; }
+    barrier(&sense);
+  }
+  return NULL;
+}
 static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
   for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++) nadj[o++] = (E){nid[adj[e].v], adj[e].w}; } return NULL; }
 static void relabel(uint32_t root) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
-  uint32_t head = 0, tail = 0, next = 0;
-  for (;;) {
-    if (head == tail) { while (next < N && nid[next] != UINT32_MAX) next++; if (next == N) break; if (tail == 0) next = root; nid[next] = tail; order[tail++] = next; }
-    uint32_t u = order[head++]; if (head + 8 < tail) __builtin_prefetch(&adj[off[order[head + 8]]]);
-    for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; __builtin_prefetch(&off[v]); } }
+  for (int t = 0; t < NT; t++) lbuf[t] = malloc(4 * (size_t)N);
+  uint32_t tail = 0, next = 0;
+  for (;;) {   /* the main body first, in parallel; then each small leftover piece from its first unvisited node */
+    if (tail == 0) next = root; else { while (next < N && nid[next] != UINT32_MAX) next++; if (next == N) break; }
+    nid[next] = tail; order[tail] = next; qlo = tail; qhi = tail + 1;
+    if (tail == 0) { run(bfs); tail = qhi; continue; }
+    tail++;
+    for (uint32_t head = qlo; head < tail; head++) { uint32_t u = order[head];
+      for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; } } }
   }
+  for (int t = 0; t < NT; t++) free(lbuf[t]);
   noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
   for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
   nadj = malloc(sizeof(E) * ((size_t)off[N] + 1));

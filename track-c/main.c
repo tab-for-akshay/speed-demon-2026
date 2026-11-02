@@ -12,26 +12,26 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #define NT_MAX 64
-static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
-#define MAXREG 10000000u
-#define TB 18                     /* name table: 2^18 slots for a pool of 100,000 names */
+#define MAXREG 1000000u           /* regions.csv ids are at most 999,999; a larger record region_id is unmatched */
+#define TB 17                     /* name table: 2^17 slots for a pool of about 100,500 names */
 #define TS (1u << TB)
+static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board) */
 typedef struct { int64_t count, idsum, asum, amin, amax, nbytes, tbytes; } Agg;
-static uint8_t *regc; static int NC; static char codes[256][4];
+static uint16_t *regc, grp[26 * 26 * 26 + 1]; static int NC;   /* regc: region id -> country code index + 1; grp: code index + 1 -> output rank */
 static const char *F; static size_t FS; static int NT; static size_t cut[NT_MAX + 1];
-static uint64_t *tab;             /* slot = hash:24 | len:8 | arena offset:32 */
-static char *arena; static size_t aused; static uint64_t *bits; static Agg agg[NT_MAX][257];
-/* intern a name (unescaped bytes s[0..len)) and return its slot; names are copied to one dense arena so lookups stay in cache */
-static uint32_t intern(const char *s, uint32_t len) {
-  uint64_t h = 0x9E3779B97F4A7C15ull; for (uint32_t i = 0; i < len; i++) h = (h ^ (uint8_t)s[i]) * 0x100000001B3ull;
-  h ^= h >> 29; uint32_t j = (uint32_t)h & (TS - 1); uint64_t tag = (h >> 40) << 40 | (uint64_t)len << 32;
+static uint64_t *tab, *bits; static Agg agg[NT_MAX][257];
+/* a name is identified by a 64-bit hash of its unescaped bytes; the slot is its id in the per-country bitsets */
+static inline uint64_t hash(const char *s, uint32_t len) {
+  uint64_t h = 0x9E3779B97F4A7C15ull ^ len, x;
+  for (; len >= 8; s += 8, len -= 8) { memcpy(&x, s, 8); h = (h ^ x) * 0xFF51AFD7ED558CCDull; h ^= h >> 32; }
+  if (len) { memcpy(&x, s, 8); x &= ~0ull >> (64 - 8 * len); h = (h ^ x) * 0xFF51AFD7ED558CCDull; }
+  h ^= h >> 29; h *= 0xC4CEB9FE1A85EC53ull; h ^= h >> 32; return h | 1;
+}
+static inline uint32_t intern(uint64_t h) {
+  uint32_t j = (uint32_t)(h >> 40) & (TS - 1);
   for (;;) {
-    uint64_t e = __atomic_load_n(&tab[j], __ATOMIC_ACQUIRE);
-    if (!e) {
-      size_t a = __atomic_fetch_add(&aused, len, __ATOMIC_RELAXED); memcpy(arena + a, s, len);
-      if (__atomic_compare_exchange_n(&tab[j], &e, tag | a, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return j;
-    }
-    if ((e & ~0xFFFFFFFFull) == tag && memcmp(arena + (uint32_t)e, s, len) == 0) return j;
+    uint64_t e = __atomic_load_n(&tab[j], __ATOMIC_RELAXED);
+    if (e == h || (!e && __atomic_compare_exchange_n(&tab[j], &e, h, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) || e == h) return j;
     j = (j + 1) & (TS - 1);
   }
 }
@@ -55,11 +55,11 @@ static void *work(void *arg) {
     int neg = *p == '-'; p += neg;
     int64_t a = 0; while (*p != '.') a = a * 10 + (*p++ - '0'); a = a * 100 + (p[1] - '0') * 10 + (p[2] - '0'); p += 3; if (neg) a = -a;
     p += (*p == '\r') + 1;
-    int g = (reg < MAXREG && regc[reg]) ? regc[reg] - 1 : NC;
+    int g = reg < MAXREG && regc[reg] ? grp[regc[reg]] : NC;
     Agg *x = &A[g]; x->count++; x->idsum += id; x->asum += a; if (a < x->amin) x->amin = a; if (a > x->amax) x->amax = a; x->nbytes += nl; x->tbytes += tl;
     const char *k = ns;
     if (np) { uint32_t m = 0; for (uint32_t i = 0; m < nl; i++) { ub[m++] = ns[i]; i += ns[i] == '"'; } k = ub; }
-    uint32_t slot = intern(k, nl);
+    uint32_t slot = intern(hash(k, nl));
     uint64_t *w = &bits[((size_t)g << (TB - 6)) + (slot >> 6)], b = 1ull << (slot & 63);
     if (!(*w & b)) __atomic_fetch_or(w, b, __ATOMIC_RELAXED);
   }
@@ -67,26 +67,25 @@ static void *work(void *arg) {
 }
 static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONLY); if (fd < 0) { perror(path); exit(1); }
   struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; char *p = mmap(NULL, *sz + 4096, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); return p; }
-static int codecmp(const void *a, const void *b) { return memcmp(a, b, 3); }
 static char *num(char *w, int64_t v) { char b[24]; int n = 0; do { b[n++] = (char)('0' + v % 10); v /= 10; } while (v); while (n) *w++ = b[--n]; return w; }
 static char *money(char *w, int64_t c) { if (c < 0) { *w++ = '-'; c = -c; } w = num(w, c / 100); *w++ = '.'; *w++ = (char)('0' + c % 100 / 10); *w++ = (char)('0' + c % 10); return w; }
 int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
   size_t rs; snprintf(path, sizeof path, "%s/regions.csv", data); const char *R = mapfile(path, &rs);
-  const char *p = memchr(R, '\n', rs) + 1, *re = R + rs;
-  for (const char *q = p + 1; q < re; q = memchr(q, '\n', (size_t)(re - q)) + 1) { const char *c = memchr(q, ',', 16) + 1;   /* collect codes */
-    if (!bsearch(c, codes, (size_t)NC, 4, codecmp)) { memcpy(codes[NC++], c, 3); qsort(codes, (size_t)NC, 4, codecmp); } }
-  regc = calloc(MAXREG, 1);
-  for (const char *q = p; q < re; q += 4) { uint32_t id = 0; while (*q != ',') id = id * 10 + (uint32_t)(*q++ - '0'); q++;
-    regc[id] = (uint8_t)((char (*)[4])bsearch(q, codes, (size_t)NC, 4, codecmp) - codes + 1); }
+  regc = calloc(MAXREG, 2);
+  for (const char *q = memchr(R, '\n', rs) + 1, *re = R + rs; q < re; q += 5) {   /* "id,ABC\n": a code is a base-26 number, so its order is the codes' byte order */
+    uint32_t id = 0; while (*q != ',') id = id * 10 + (uint32_t)(*q++ - '0');
+    uint16_t c = (uint16_t)((q[1] - 'A') * 676 + (q[2] - 'A') * 26 + (q[3] - 'A') + 1); regc[id] = c; grp[c] = 1; }
+  char codes[257][4];
+  for (int c = 1; c <= 26 * 26 * 26; c++) if (grp[c]) { codes[NC][0] = (char)('A' + (c - 1) / 676); codes[NC][1] = (char)('A' + (c - 1) / 26 % 26); codes[NC][2] = (char)('A' + (c - 1) % 26); grp[c] = (uint16_t)NC++; }
   snprintf(path, sizeof path, "%s/records.csv", data); F = mapfile(path, &FS);
-  p = memchr(F, '\n', FS) + 1; size_t body = (size_t)(p - F);
+  size_t body = (size_t)((const char *)memchr(F, '\n', FS) + 1 - F);
   NT = ncpu();
   /* a record starts right after an LF followed by a digit or a BOM; by spec 2.2 an LF inside a note never is */
   cut[0] = body; cut[NT] = FS;
   for (int i = 1; i < NT; i++) { size_t c = body + (FS - body) * (size_t)i / (size_t)NT; if (c < cut[i - 1]) c = cut[i - 1];
     while (c < FS && !(F[c - 1] == '\n' && ((F[c] >= '0' && F[c] <= '9') || (uint8_t)F[c] == 0xEF))) c++; cut[i] = c; }
-  tab = calloc(TS, 8); arena = malloc(1 << 24); bits = calloc((size_t)(NC + 1) << (TB - 6), 8);
+  tab = calloc(TS, 8); bits = calloc((size_t)(NC + 1) << (TB - 6), 8);
   pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, work, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
   char buf[257 * 200], *w = buf;
   for (int g = 0; g <= NC; g++) {
