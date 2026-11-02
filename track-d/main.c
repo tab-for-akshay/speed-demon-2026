@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
   free(nid);
   qord = malloc(4 * (size_t)Q + 4); for (uint32_t i = 0; i < Q; i++) qord[i] = i;
   qsort(qord, Q, 4, qcmp);   /* queries in source order: threads working at the same time search nearby parts of the graph */
-  run(solve);
+  NT = (NT + 1) / 2; run(solve);   /* one search per physical core: each holds two distance arrays, so memory beats the hyperthreads here */
   uint64_t *d64 = NULL;
   for (uint32_t i = 0; i < Q; i++) if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); }
   snprintf(path, sizeof path, "%s/distances.txt", out);
