@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -14,15 +15,32 @@
 #define NT_MAX 64
 static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
 typedef struct { uint32_t v, w; } E;
-static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static E *adj; static int64_t *ans;
+static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static uint32_t *adj; static int64_t *ans;
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
+/* an edge is one 32-bit word: head in the low VB bits, weight above; a weight too big for its field is WX there
+   and its real value sits in a short sorted list of (edge position, weight) per direction */
+static uint32_t VB, VM, WX, *cadj, *cradj, *roff, *epos[3], *ewt[3], nesc[3], *tpos[NT_MAX], *twt[NT_MAX], tn[NT_MAX], tcap[NT_MAX];
+static inline void esc(long t, uint32_t e, uint32_t w) { if (tn[t] == tcap[t]) { tcap[t] = tcap[t] ? 2 * tcap[t] : 256; tpos[t] = realloc(tpos[t], 4 * (size_t)tcap[t]); twt[t] = realloc(twt[t], 4 * (size_t)tcap[t]); } tpos[t][tn[t]] = e; twt[t][tn[t]++] = w; }
+static inline uint32_t pack(long t, uint32_t e, uint32_t v, uint32_t w) { if (w >= WX) { esc(t, e, w); w = WX; } return v | w << VB; }
+static inline uint32_t wt(int k, const uint32_t *g, uint32_t e) {
+  uint32_t w = g[e] >> VB; if (w != WX) return w;
+  uint32_t lo = 0, hi = nesc[k]; while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (epos[k][m] <= e) lo = m; else hi = m; } return ewt[k][lo];
+}
+static int pcmp(const void *a, const void *b) { const uint32_t *x = a, *y = b; return (x[0] > y[0]) - (x[0] < y[0]); }
+static void gather(int k) {   /* the threads' escaped weights, sorted by edge position */
+  uint32_t n = 0; for (int t = 0; t < NT; t++) n += tn[t];
+  uint32_t *pr = malloc(8 * (size_t)n + 8); n = 0;
+  for (int t = 0; t < NT; t++) { for (uint32_t i = 0; i < tn[t]; i++) { pr[2 * n] = tpos[t][i]; pr[2 * n++ + 1] = twt[t][i]; } tn[t] = 0; }
+  qsort(pr, n, 8, pcmp); epos[k] = malloc(4 * (size_t)n + 4); ewt[k] = malloc(4 * (size_t)n + 4); nesc[k] = n;
+  for (uint32_t i = 0; i < n; i++) { epos[k][i] = pr[2 * i]; ewt[k][i] = pr[2 * i + 1]; } free(pr);
+}
 static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
   while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
 static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
+  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p), o = __atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED); adj[o] = pack(i, o, v, w); } return NULL; }
 /* radix heap of (distance << 32 | node); keys never drop below the last popped one */
 typedef struct { uint64_t *a[33]; uint32_t n[33], cap[33]; uint32_t last; } RH;
 static inline void rh_push(RH *h, uint64_t x) {
@@ -38,23 +56,6 @@ static inline int rh_min(RH *h, uint32_t *k) {   /* the smallest key, or 0 if em
     for (uint32_t i = 0; i < c; i++) rh_push(h, h->a[b][i]);
   }
   *k = h->last; return 1;
-}
-/* after relabelling, an edge is one 32-bit word: head in the low VB bits, weight above; a weight too big for its field is WX there
-   and its real value sits in a short sorted list of (edge position, weight) per direction */
-static uint32_t VB, VM, WX, *cadj, *cradj, *roff, *epos[2], *ewt[2], nesc[2], *tpos[NT_MAX], *twt[NT_MAX], tn[NT_MAX], tcap[NT_MAX];
-static inline void esc(long t, uint32_t e, uint32_t w) { if (tn[t] == tcap[t]) { tcap[t] = tcap[t] ? 2 * tcap[t] : 256; tpos[t] = realloc(tpos[t], 4 * (size_t)tcap[t]); twt[t] = realloc(twt[t], 4 * (size_t)tcap[t]); } tpos[t][tn[t]] = e; twt[t][tn[t]++] = w; }
-static inline uint32_t pack(long t, uint32_t e, uint32_t v, uint32_t w) { if (w >= WX) { esc(t, e, w); w = WX; } return v | w << VB; }
-static inline uint32_t wt(int k, const uint32_t *g, uint32_t e) {
-  uint32_t w = g[e] >> VB; if (w != WX) return w;
-  uint32_t lo = 0, hi = nesc[k]; while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (epos[k][m] <= e) lo = m; else hi = m; } return ewt[k][lo];
-}
-static int pcmp(const void *a, const void *b) { const uint32_t *x = a, *y = b; return (x[0] > y[0]) - (x[0] < y[0]); }
-static void gather(int k) {   /* the threads' escaped weights, sorted by edge position */
-  uint32_t n = 0; for (int t = 0; t < NT; t++) n += tn[t];
-  uint32_t *pr = malloc(8 * (size_t)n + 8); n = 0;
-  for (int t = 0; t < NT; t++) { for (uint32_t i = 0; i < tn[t]; i++) { pr[2 * n] = tpos[t][i]; pr[2 * n++ + 1] = twt[t][i]; } tn[t] = 0; }
-  qsort(pr, n, 8, pcmp); epos[k] = malloc(4 * (size_t)n + 4); ewt[k] = malloc(4 * (size_t)n + 4); nesc[k] = n;
-  for (uint32_t i = 0; i < n; i++) { epos[k][i] = pr[2 * i]; ewt[k][i] = pr[2 * i + 1]; } free(pr);
 }
 static void *rcount(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
   for (uint32_t e = off[lo]; e < off[hi]; e++) __atomic_fetch_add(&roff[(cadj[e] & VM) + 2], 1, __ATOMIC_RELAXED); return NULL; }
@@ -113,12 +114,12 @@ static void *grow(void *a) {
   while (s < N && off[s] == off[s + 1]) s++;
   if (s < N && __atomic_compare_exchange_n(&nid[s], &x, 0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) q[n++] = s;
   for (uint32_t h = 0; h < n; h++) { uint32_t u = q[h]; if (h + 4 < n) __builtin_prefetch(&off[q[h + 4]]);
-    for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; x = UINT32_MAX;
+    for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e] & VM; x = UINT32_MAX;
       if (nid[v] == UINT32_MAX && __atomic_compare_exchange_n(&nid[v], &x, 0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) q[n++] = v; } }
   rn[t] = n; return NULL;
 }
 static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
-  for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++, o++) cadj[o] = pack(t, o, nid[adj[e].v], adj[e].w); } return NULL; }
+  for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++, o++) cadj[o] = pack(t, o, nid[adj[e] & VM], wt(2, adj, e)); } return NULL; }
 static void relabel(void) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
   run(grow);
@@ -129,11 +130,10 @@ static void relabel(void) {
     if (nid[next] != UINT32_MAX) continue;
     nid[next] = tail; order[tail++] = next;
     for (; head < tail; head++) { uint32_t u = order[head];
-      for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; } } }
+      for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e] & VM; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; } } }
   }
   noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
   for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
-  VB = 1; while ((1u << VB) < N) VB++; VM = (1u << VB) - 1; WX = VB >= 32 ? 0 : (uint32_t)((1ull << (32 - VB)) - 1);
   cadj = malloc(4 * ((size_t)off[N] + 1));
   run(pass3); gather(0);
   free(adj); free(off); free(order); off = noff;
@@ -181,8 +181,9 @@ int main(int argc, char **argv) {
   off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
   run(pass1);
   for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
-  adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
-  run(pass2);   /* leaves off[u] = end of u = start of u+1: shift back */
+  VB = 1; while ((1u << VB) < N) VB++; VM = (1u << VB) - 1; WX = (uint32_t)((1ull << (32 - VB)) - 1);   /* edges packed from the start */
+  adj = malloc(4 * ((size_t)off[N] + 1));
+  run(pass2); gather(2);   /* leaves off[u] = end of u = start of u+1: shift back */
   memmove(off + 1, off, 4 * (size_t)N); off[0] = 0;
   size_t qsz; snprintf(path, sizeof path, "%s/queries.txt", data); const char *qf = mapfile(path, &qsz);
   Q = 0; for (size_t i = 0; i < qsz; i++) Q += qf[i] == '\n';
@@ -197,7 +198,8 @@ int main(int argc, char **argv) {
   free(nid);
   qord = malloc(4 * (size_t)Q + 4); for (uint32_t i = 0; i < Q; i++) qord[i] = i;
   qsort(qord, Q, 4, qcmp);   /* queries in source order: threads working at the same time search nearby parts of the graph */
-  NT = (NT + 1) / 2; run(solve);   /* one search per physical core: measured against all threads, see PERF.md */
+  run(solve);
+  free(cradj); free(roff); malloc_trim(0);   /* the 64-bit fallback searches forward only: drop the reverse graph and what the threads freed */
   uint64_t *d64 = NULL;
   for (uint32_t i = 0; i < Q; i++) if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); }
   snprintf(path, sizeof path, "%s/distances.txt", out);
