@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 
 #define NT_MAX 64
+static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
 #define HSIZE 8192          /* per-thread endpoint table, power of two */
 #define MAXE 4096           /* max distinct endpoints per thread */
 #define BUFSZ (1 << 20)
@@ -170,7 +172,7 @@ int main(int argc, char **argv) {
   int fd = open(path, O_RDONLY); if (fd < 0) { perror("open"); return 1; }
   struct stat st; fstat(fd, &st); off_t size = st.st_size;
   BASE_H = days_from_civil(2026, 10, 30) * 24 + 18 - 64;   /* slack before the span */
-  long nt = sysconf(_SC_NPROCESSORS_ONLN); if (nt < 1) nt = 1; if (nt > NT_MAX) nt = NT_MAX;
+  long nt = ncpu();
   if (size < (1 << 20)) nt = 1;
   Th *th = calloc((size_t)nt, sizeof(Th)); pthread_t pt[NT_MAX];
   /* split at newlines */

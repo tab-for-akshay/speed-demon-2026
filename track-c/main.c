@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #define NT_MAX 64
+static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
 #define MAXREG 10000000u
 #define TB 18                     /* name table: 2^18 slots for a pool of 100,000 names */
 #define TS (1u << TB)
@@ -79,7 +81,7 @@ int main(int argc, char **argv) {
     regc[id] = (uint8_t)((char (*)[4])bsearch(q, codes, (size_t)NC, 4, codecmp) - codes + 1); }
   snprintf(path, sizeof path, "%s/records.csv", data); F = mapfile(path, &FS);
   p = memchr(F, '\n', FS) + 1; size_t body = (size_t)(p - F);
-  long nt = sysconf(_SC_NPROCESSORS_ONLN); NT = nt < 1 ? 1 : nt > NT_MAX ? NT_MAX : (int)nt;
+  NT = ncpu();
   /* a record starts right after an LF followed by a digit or a BOM; by spec 2.2 an LF inside a note never is */
   cut[0] = body; cut[NT] = FS;
   for (int i = 1; i < NT; i++) { size_t c = body + (FS - body) * (size_t)i / (size_t)NT; if (c < cut[i - 1]) c = cut[i - 1];

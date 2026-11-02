@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #define NT_MAX 64
+static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
 typedef struct { uint32_t v, w; } E;
 static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static E *adj; static int64_t *ans;
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
@@ -99,7 +101,7 @@ static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONL
   struct stat st; fstat(fd, &st); *sz = (size_t)st.st_size; char *p = *sz ? mmap(NULL, *sz, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0) : NULL; close(fd); return p; }
 int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
-  long nt = sysconf(_SC_NPROCESSORS_ONLN); NT = nt < 1 ? 1 : nt > NT_MAX ? NT_MAX : (int)nt;
+  NT = ncpu();
   snprintf(path, sizeof path, "%s/graph.txt", data); G = mapfile(path, &GS);
   const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
   cb[0] = body; cb[NT] = GS;
