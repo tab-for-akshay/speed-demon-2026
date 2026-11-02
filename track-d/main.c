@@ -18,18 +18,7 @@ static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static E *adj; stat
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
-/* decimal digits up to the first non-digit, 8 bytes at a time (SWAR) when 8 bytes are readable, else one by one */
-static inline uint64_t num8(const char **pp, const char *lim) {
-  const char *p = *pp; uint64_t x, v = 0;
-  if (lim - p >= 8) { memcpy(&x, p, 8); uint64_t t = x - 0x3030303030303030ull, m = (t | (t + 0x7676767676767676ull)) & 0x8080808080808080ull;
-    int n = m ? __builtin_ctzll(m) >> 3 : 0;
-    if (n) { v = x << (64 - 8 * n); v = (v & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8; v = (v & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
-      *pp = p + n; return (v & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32; } }
-  while ((uint8_t)(*p - '0') < 10) v = v * 10 + (uint64_t)(*p++ - '0');
-  *pp = p; return v;
-}
-static const char *LIM;   /* end of the file being parsed */
-static inline uint32_t num(const char **pp) { uint32_t v = (uint32_t)num8(pp, LIM); (*pp)++; return v; }   /* and skip the separator */
+static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
 static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
   while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
 static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
@@ -104,10 +93,12 @@ static void relabel(void) {
   run(pass3);
   free(adj); free(off); free(order); adj = nadj; off = noff;
 }
+static uint32_t *qord;
+static int qcmp(const void *a, const void *b) { uint32_t x = qs[*(const uint32_t *)a], y = qs[*(const uint32_t *)b]; return (x > y) - (x < y); }
 static void *solve(void *a) {
   (void)a; uint32_t *dist = malloc(4 * (size_t)N); memset(dist, 0xff, 4 * (size_t)N);
   size_t tc = 1 << 16; uint32_t *tch = malloc(tc * 4); RH h = {0};
-  for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break;
+  for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break; i = qord[i];
     uint32_t s = qs[i], t = qt[i];
     ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : search(s, t, dist, &tch, &tc, &h); }
   free(dist); free(tch); for (int b = 0; b < 33; b++) free(h.a[b]); return NULL;
@@ -139,7 +130,7 @@ int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
   NT = ncpu();
   snprintf(path, sizeof path, "%s/graph.txt", data); G = mapfile(path, &GS);
-  LIM = G + GS; const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
+  const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
   cb[0] = body; cb[NT] = GS;
   for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
   off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
@@ -151,11 +142,13 @@ int main(int argc, char **argv) {
   size_t qsz; snprintf(path, sizeof path, "%s/queries.txt", data); const char *qf = mapfile(path, &qsz);
   Q = 0; for (size_t i = 0; i < qsz; i++) Q += qf[i] == '\n';
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
-  LIM = qf + qsz; p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
+  p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
   relabel();
   { uint8_t *h2 = calloc(N, 1); for (uint32_t i = 0; i < N; i++) h2[nid[i]] = hasin[i]; free(hasin); hasin = h2; }
   for (uint32_t i = 0; i < Q; i++) { qs[i] = nid[qs[i]]; qt[i] = nid[qt[i]]; }
   free(nid);
+  qord = malloc(4 * (size_t)Q + 4); for (uint32_t i = 0; i < Q; i++) qord[i] = i;
+  qsort(qord, Q, 4, qcmp);   /* queries in source order: threads working at the same time search nearby parts of the graph */
   run(solve);
   uint64_t *d64 = NULL;
   for (uint32_t i = 0; i < Q; i++) if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); }
