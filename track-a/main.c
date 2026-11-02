@@ -20,7 +20,7 @@ static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, 
 typedef struct Blk { struct Blk *next; uint32_t n, lat[BS]; uint16_t key[BS]; } Blk;   /* key = endpoint slot | 5xx flag << 15 */
 static const char *F; static size_t FS; static int NT; static size_t cut[NT_MAX + 1]; static long BASE_H;
 static uint64_t tab[TS]; static const char *eps[TS]; static uint32_t epl[TS];
-static Blk *head[NT_MAX][NH]; static uint16_t order[TS]; static int NE; static char *hout[NH]; static size_t hlen[NH]; static int nexth;
+static Blk *head[NT_MAX][NH]; static uint16_t order[TS]; static int NE; static char *hout[NH]; static size_t hlen[NH]; static int nexth, wnext, ready[NH]; static FILE *outf; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static long days_from_civil(int y, int m, int d) {
   y -= m <= 2; long era = (y >= 0 ? y : y - 399) / 400; unsigned yoe = (unsigned)(y - era * 400);
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1; unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
@@ -35,12 +35,13 @@ static inline uint32_t intern(const char *s, uint32_t len) {
   for (uint32_t j = (uint32_t)(h >> 40) & (TS - 1);; j = (j + 1) & (TS - 1)) {
     uint64_t e = __atomic_load_n(&tab[j], __ATOMIC_ACQUIRE);
     if (e == h) return j;
-    if (!e) { eps[j] = s; epl[j] = len; if (__atomic_compare_exchange_n(&tab[j], &e, h, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE) || e == h) return j; }
+    if (!e) { if (__atomic_compare_exchange_n(&tab[j], &e, h, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { eps[j] = s; epl[j] = len; return j; } if (e == h) return j; }   /* the winner records the bytes; they are read only after the threads join */
   }
 }
 static void *parse(void *arg) {
   long t = (long)arg; const char *p = F + cut[t], *end = F + cut[t + 1];
   size_t nb = (size_t)(end - p) / 40 / BS + NH + 1; Blk *pool = mmap(NULL, nb * sizeof(Blk), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), *cur[NH] = {0};
+  madvise(pool, nb * sizeof(Blk), MADV_NOHUGEPAGE);   /* only the pages touched count toward memory */
   char lastday[10] = {0}; long lastdh = 0;
   while (p < end) {
     int hh = (p[11] - '0') * 10 + (p[12] - '0');
@@ -82,7 +83,8 @@ static void *output(void *arg) {
     int h = __atomic_fetch_add(&nexth, 1, __ATOMIC_RELAXED); if (h >= NH) break;
     memset(cnt, 0, sizeof cnt); memset(err, 0, sizeof err); size_t n = 0;
     for (int t = 0; t < NT; t++) for (Blk *b = head[t][h]; b; b = b->next) { n += b->n; for (uint32_t i = 0; i < b->n; i++) { cnt[b->key[i] & (TS - 1)]++; err[b->key[i] & (TS - 1)] += b->key[i] >> 15; } }
-    if (!n) continue;
+    char *o = NULL, *w = NULL;
+    if (n) {
     if (n > cap) { cap = n; v = realloc(v, 4 * n); tmp = realloc(tmp, 4 * n); }
     uint32_t s = 0; for (uint32_t k = 0; k < TS; k++) { pos[k] = s; s += cnt[k]; }
     for (int t = 0; t < NT; t++) for (Blk *b = head[t][h]; b; b = b->next) for (uint32_t i = 0; i < b->n; i++) v[pos[b->key[i] & (TS - 1)]++] = b->lat[i];
@@ -90,7 +92,7 @@ static void *output(void *arg) {
     unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365, doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
     unsigned d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9; long y = (long)yoe + era * 400 + (m <= 2);
     char hs[32]; snprintf(hs, sizeof hs, "%04ld-%02u-%02uT%02d:00:00Z ", y, m, d, (int)(ah % 24));
-    char *o = malloc((size_t)NE * 180), *w = o;
+    w = o = malloc((size_t)NE * 180);
     for (int k = 0; k < NE; k++) {
       uint32_t e = order[k], c = cnt[e]; if (!c) continue;
       uint32_t *g = v + pos[e] - c; sort_u32(g, c, tmp);
@@ -98,7 +100,11 @@ static void *output(void *arg) {
       w = u2s(w, c); *w++ = ' '; w = u2s(w, g[(50ull * c + 99) / 100 - 1]); *w++ = ' '; w = u2s(w, g[(95ull * c + 99) / 100 - 1]); *w++ = ' ';
       w = u2s(w, g[(99ull * c + 99) / 100 - 1]); *w++ = ' '; w = u2s(w, err[e]); *w++ = ' '; w = u2s(w, (uint32_t)((uint64_t)err[e] * 1000000ull / c)); *w++ = '\n';
     }
-    hout[h] = o; hlen[h] = (size_t)(w - o);
+    }
+    /* hand the hour over, then write every finished hour in order, so few hours' text is held at once */
+    pthread_mutex_lock(&mu); hout[h] = o; hlen[h] = (size_t)(w - o); ready[h] = 1;
+    for (; wnext < NH && ready[wnext]; wnext++) { fwrite(hout[wnext], 1, hlen[wnext], outf); free(hout[wnext]); }
+    pthread_mutex_unlock(&mu);
   }
   free(v); free(tmp); return NULL;
 }
@@ -113,8 +119,7 @@ int main(int argc, char **argv) {
   run(parse);
   for (uint32_t j = 0; j < TS; j++) if (tab[j]) order[NE++] = (uint16_t)j;
   qsort(order, (size_t)NE, 2, epcmp);
+  snprintf(path, sizeof path, "%s/summary.txt", out); outf = fopen(path, "wb"); if (!outf) { perror("fopen"); return 1; }
   run(output);
-  snprintf(path, sizeof path, "%s/summary.txt", out); FILE *f = fopen(path, "wb"); if (!f) { perror("fopen"); return 1; }
-  for (int h = 0; h < NH; h++) if (hlen[h]) fwrite(hout[h], 1, hlen[h], f);
-  fclose(f); return 0;
+  fclose(outf); return 0;
 }
