@@ -35,6 +35,16 @@ static inline uint32_t intern(uint64_t h) {
     j = (j + 1) & (TS - 1);
   }
 }
+/* decimal digits up to the first non-digit, 8 bytes at a time (SWAR) when 8 bytes are readable, else one by one */
+static inline uint64_t num8(const char **pp, const char *lim) {
+  const char *p = *pp; uint64_t x, v = 0;
+  if (lim - p >= 8) { memcpy(&x, p, 8); uint64_t t = x - 0x3030303030303030ull, m = (t | (t + 0x7676767676767676ull)) & 0x8080808080808080ull;
+    int n = m ? __builtin_ctzll(m) >> 3 : 0;
+    if (n) { v = x << (64 - 8 * n); v = (v & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8; v = (v & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
+      *pp = p + n; return (v & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32; } }
+  while ((uint8_t)(*p - '0') < 10) v = v * 10 + (uint64_t)(*p++ - '0');
+  *pp = p; return v;
+}
 static inline const char *quoted(const char *p, uint32_t *ulen, uint32_t *pairs) {  /* p on the opening quote */
   const char *q = p + 1; uint32_t n = 0;
   for (;;) { q = memchr(q, '"', (size_t)(F + FS - q)); if (q[1] != '"') break; n++; q += 2; }
@@ -45,15 +55,15 @@ static void *work(void *arg) {
   for (int g = 0; g <= NC; g++) A[g] = (Agg){0, 0, 0, INT64_MAX, INT64_MIN, 0, 0};
   while (p < e) {
     if ((uint8_t)*p == 0xEF) p += 3;
-    int64_t id = 0; while (*p != ',') id = id * 10 + (*p++ - '0'); p++;
+    int64_t id = (int64_t)num8(&p, F + FS); p++;
     const char *ns = p; uint32_t nl = 0, np = 0;
     if (*p == '"') { p = quoted(p, &nl, &np); ns++; } else { while (*p != ',') p++; nl = (uint32_t)(p - ns); }
     p++;
     uint32_t tl, tp; if (*p == '"') p = quoted(p, &tl, &tp); else { const char *s0 = p; while (*p != ',') p++; tl = (uint32_t)(p - s0); }
     p++;
-    uint32_t reg = 0; while (*p != ',') reg = reg * 10 + (uint32_t)(*p++ - '0'); p++;
+    uint32_t reg = (uint32_t)num8(&p, F + FS); p++;
     int neg = *p == '-'; p += neg;
-    int64_t a = 0; while (*p != '.') a = a * 10 + (*p++ - '0'); a = a * 100 + (p[1] - '0') * 10 + (p[2] - '0'); p += 3; if (neg) a = -a;
+    int64_t a = (int64_t)num8(&p, F + FS); a = a * 100 + (p[1] - '0') * 10 + (p[2] - '0'); p += 3; if (neg) a = -a;
     p += (*p == '\r') + 1;
     int g = reg < MAXREG && regc[reg] ? grp[regc[reg]] : NC;
     Agg *x = &A[g]; x->count++; x->idsum += id; x->asum += a; if (a < x->amin) x->amin = a; if (a > x->amax) x->amax = a; x->nbytes += nl; x->tbytes += tl;

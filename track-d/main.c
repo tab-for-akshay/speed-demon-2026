@@ -18,16 +18,22 @@ static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static E *adj; stat
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
-static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
-/* CSR build without atomics: each thread counts its own edges per tail, the counts become per-thread write positions */
-static uint32_t *cnt[NT_MAX], rsum[NT_MAX];
-static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint32_t *c = cnt[i] = calloc((size_t)N + 1, 4);
-  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); c[u]++; hasin[v] = 1; } return NULL; }
-static void *scan(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT), s = 0;
-  if (!off[N + 1]) { for (uint32_t u = lo; u < hi; u++) for (int k = 0; k < NT; k++) s += cnt[k][u]; rsum[t] = s; return NULL; }
-  s = rsum[t]; for (uint32_t u = lo; u < hi; u++) { off[u] = s; for (int k = 0; k < NT; k++) { uint32_t x = cnt[k][u]; cnt[k][u] = s; s += x; } } return NULL; }
-static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint32_t *c = cnt[i];
-  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[c[u]++] = (E){v, w}; } return NULL; }
+/* decimal digits up to the first non-digit, 8 bytes at a time (SWAR) when 8 bytes are readable, else one by one */
+static inline uint64_t num8(const char **pp, const char *lim) {
+  const char *p = *pp; uint64_t x, v = 0;
+  if (lim - p >= 8) { memcpy(&x, p, 8); uint64_t t = x - 0x3030303030303030ull, m = (t | (t + 0x7676767676767676ull)) & 0x8080808080808080ull;
+    int n = m ? __builtin_ctzll(m) >> 3 : 0;
+    if (n) { v = x << (64 - 8 * n); v = (v & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8; v = (v & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
+      *pp = p + n; return (v & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32; } }
+  while ((uint8_t)(*p - '0') < 10) v = v * 10 + (uint64_t)(*p++ - '0');
+  *pp = p; return v;
+}
+static const char *LIM;   /* end of the file being parsed */
+static inline uint32_t num(const char **pp) { uint32_t v = (uint32_t)num8(pp, LIM); (*pp)++; return v; }   /* and skip the separator */
+static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
+  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
+static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
+  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
 /* radix heap of (distance << 32 | node); keys never drop below the last popped one */
 typedef struct { uint64_t *a[33]; uint32_t n[33], cap[33]; uint32_t last; } RH;
 static inline void rh_push(RH *h, uint64_t x) {
@@ -133,20 +139,19 @@ int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
   NT = ncpu();
   snprintf(path, sizeof path, "%s/graph.txt", data); G = mapfile(path, &GS);
-  const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
+  LIM = G + GS; const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
   cb[0] = body; cb[NT] = GS;
   for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
   off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
-  run(pass1); run(scan);
-  { uint32_t s = 0; for (int t = 0; t < NT; t++) { uint32_t x = rsum[t]; rsum[t] = s; s += x; } off[N] = s; off[N + 1] = 1; }
-  run(scan);
+  run(pass1);
+  for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
   adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
-  run(pass2);
-  for (int t = 0; t < NT; t++) free(cnt[t]);
+  run(pass2);   /* leaves off[u] = end of u = start of u+1: shift back */
+  memmove(off + 1, off, 4 * (size_t)N); off[0] = 0;
   size_t qsz; snprintf(path, sizeof path, "%s/queries.txt", data); const char *qf = mapfile(path, &qsz);
   Q = 0; for (size_t i = 0; i < qsz; i++) Q += qf[i] == '\n';
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
-  p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
+  LIM = qf + qsz; p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
   relabel();
   { uint8_t *h2 = calloc(N, 1); for (uint32_t i = 0; i < N; i++) h2[nid[i]] = hasin[i]; free(hasin); hasin = h2; }
   for (uint32_t i = 0; i < Q; i++) { qs[i] = nid[qs[i]]; qt[i] = nid[qt[i]]; }

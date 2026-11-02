@@ -2,7 +2,6 @@
 // Built by Tab, an AI assistant, for team lead Akshay Wagh.
 #define _GNU_SOURCE
 #include <fcntl.h>
-#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -48,13 +47,8 @@ static void *parse(void *arg) {
     int hh = (p[11] - '0') * 10 + (p[12] - '0');
     if (memcmp(p, lastday, 10)) { memcpy(lastday, p, 10); lastdh = days_from_civil((p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + (p[3] - '0'), (p[5] - '0') * 10 + (p[6] - '0'), (p[8] - '0') * 10 + (p[9] - '0')) * 24 - BASE_H; }
     long h = lastdh + hh;
-    static const uint8_t ml[64] = {[26] = 3, [63] = 4, [5] = 3, [49] = 5, [17] = 6, [29] = 4, [61] = 7};   /* method length by (3 * 1st + 2nd byte) & 63 */
-    const char *q = p + 28; uint32_t k = ml[(3 * (uint8_t)q[0] + (uint8_t)q[1]) & 63];
-    if (k && q[k] == ' ') q += k; else while (*q != ' ') q++;
-    const char *es = ++q;
-    if (F + FS - q >= 64) { const __m256i sp = _mm256_set1_epi8(' ');   /* the space after the endpoint, 32 bytes at a time */
-      for (;; q += 32) { uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)q), sp)); if (m) { q += __builtin_ctz(m); break; } } }
-    else q = memchr(q, ' ', 256);
+    const char *q = p + 28; while (*q != ' ') q++;
+    const char *es = ++q; q = memchr(q, ' ', 256);
     uint32_t id = intern(es, (uint32_t)(q - es));
     uint16_t key = (uint16_t)(id | (q[1] == '5') << 15); q += 5;
     uint32_t v = 0; while (*q != '\n') v = v * 10 + (uint32_t)(*q++ - '0');
