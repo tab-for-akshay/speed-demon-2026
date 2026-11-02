@@ -19,6 +19,9 @@ static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
+static volatile uint64_t probe_sink;
+static void *probe(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint64_t x = 0;   /* TIMING PROBE: one extra parse of the graph */
+  while (p < e) { x += num(&p); x += num(&p); x += num(&p); } probe_sink += x; return NULL; }
 static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
   while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
 static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
@@ -160,6 +163,7 @@ int main(int argc, char **argv) {
   cb[0] = body; cb[NT] = GS;
   for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
   off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
+  run(probe);
   run(pass1);
   for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
   adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
@@ -178,7 +182,7 @@ int main(int argc, char **argv) {
   free(nid);
   qord = malloc(4 * (size_t)Q + 4); for (uint32_t i = 0; i < Q; i++) qord[i] = i;
   qsort(qord, Q, 4, qcmp);   /* queries in source order: threads working at the same time search nearby parts of the graph */
-  NT = (NT + 1) / 2; run(solve); qnext = 0; run(solve);   /* TIMING PROBE: the searches run twice, to measure their share of T */   /* one search per physical core: each holds two distance arrays, so memory beats the hyperthreads here */
+  NT = (NT + 1) / 2; run(solve);   /* one search per physical core: each holds two distance arrays, so memory beats the hyperthreads here */
   uint64_t *d64 = NULL;
   for (uint32_t i = 0; i < Q; i++) if (ans[i] == -2) { if (!d64) { d64 = malloc(8 * (size_t)N); memset(d64, 0xff, 8 * (size_t)N); } ans[i] = search64(qs[i], qt[i], d64); }
   snprintf(path, sizeof path, "%s/distances.txt", out);
