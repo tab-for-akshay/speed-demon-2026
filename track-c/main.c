@@ -51,7 +51,7 @@ static inline const char *quoted(const char *p, uint32_t *ulen, uint32_t *pairs)
   *ulen = (uint32_t)(q - p - 1) - n; *pairs = n; return q + 1;
 }
 static void *work(void *arg) {
-  long ti = (long)arg; const char *p = F + cut[ti], *e = F + cut[ti + 1]; Agg *A = agg[ti]; char ub[4096]; uint64_t ph = 0, pb = 0, qb = 0, *pw = NULL, *qw = NULL; int pg = 0;
+  long ti = (long)arg; const char *p = F + cut[ti], *e = F + cut[ti + 1]; Agg *A = agg[ti]; char ub[4096]; uint64_t PH[4], PB[4], *PW[4], n = 0; int PG[4];
   for (int g = 0; g <= NC; g++) A[g] = (Agg){0, 0, 0, INT64_MAX, INT64_MIN, 0, 0};
   while (p < e) {
     if ((uint8_t)*p == 0xEF) p += 3;
@@ -69,16 +69,18 @@ static void *work(void *arg) {
     Agg *x = &A[g]; x->count++; x->idsum += id; x->asum += a; if (a < x->amin) x->amin = a; if (a > x->amax) x->amax = a; x->nbytes += nl; x->tbytes += tl;
     const char *k = ns;
     if (np) { uint32_t m = 0; for (uint32_t i = 0; m < nl; i++) { ub[m++] = ns[i]; i += ns[i] == '"'; } k = ub; }
-    /* software pipeline: this record's table slot is prefetched, the previous record is looked up and its bit word prefetched,
-       and the one before that sets its bit, so both cache misses overlap with parsing */
+    /* software pipeline, two records per stage: this record's table slot is prefetched, the record two back is looked up and
+       its bit word prefetched, the record four back sets its bit, so both cache misses overlap with parsing other records */
     uint64_t h = hash(k, nl); __builtin_prefetch(&tab[(uint32_t)(h >> 40) & (TS - 1)]);
-    if (ph) { uint32_t slot = intern(ph); pw = &bits[((size_t)pg << (TB - 6)) + (slot >> 6)]; pb = 1ull << (slot & 63); __builtin_prefetch(pw, 1); }
-    if (qw && !(*qw & qb)) __atomic_fetch_or(qw, qb, __ATOMIC_RELAXED);
-    qw = pw; qb = pb; pw = NULL; ph = h; pg = g;
+    PH[n & 3] = h; PG[n & 3] = g;
+    if (n >= 2) { uint32_t j = (n - 2) & 3, slot = intern(PH[j]); PW[j] = &bits[((size_t)PG[j] << (TB - 6)) + (slot >> 6)]; PB[j] = 1ull << (slot & 63); __builtin_prefetch(PW[j], 1); }
+    if (n >= 4) { uint32_t j = (n - 4) & 3; if (!(*PW[j] & PB[j])) __atomic_fetch_or(PW[j], PB[j], __ATOMIC_RELAXED); }
+    n++;
   }
-  if (ph) { uint32_t slot = intern(ph); pw = &bits[((size_t)pg << (TB - 6)) + (slot >> 6)]; pb = 1ull << (slot & 63); }
-  if (qw && !(*qw & qb)) __atomic_fetch_or(qw, qb, __ATOMIC_RELAXED);
-  if (pw && !(*pw & pb)) __atomic_fetch_or(pw, pb, __ATOMIC_RELAXED);
+  for (uint64_t r = n >= 4 ? n - 4 : 0; r < n; r++) {   /* drain: records not yet looked up, then bits not yet set */
+    uint32_t j = r & 3; if (r + 2 >= n) { uint32_t slot = intern(PH[j]); PW[j] = &bits[((size_t)PG[j] << (TB - 6)) + (slot >> 6)]; PB[j] = 1ull << (slot & 63); }
+    if (!(*PW[j] & PB[j])) __atomic_fetch_or(PW[j], PB[j], __ATOMIC_RELAXED);
+  }
   return NULL;
 }
 static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONLY); if (fd < 0) { perror(path); exit(1); }
