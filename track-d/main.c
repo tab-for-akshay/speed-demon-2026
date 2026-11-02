@@ -122,7 +122,6 @@ static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64
 static void relabel(void) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
   run(grow);
-  for (int t = 0; t < NT; t++) free(reg[t]); memset(nid, 0xff, 4 * (size_t)N); run(grow);   /* TIMING PROBE: the region growing runs twice */
   uint32_t tail = 0;
   for (int t = 0; t < NT; t++) { for (uint32_t i = 0; i < rn[t]; i++) order[tail + i] = reg[t][i]; tail += rn[t]; free(reg[t]); }
   for (uint32_t i = 0; i < tail; i++) nid[order[i]] = i;
@@ -190,6 +189,10 @@ int main(int argc, char **argv) {
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
   p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
   relabel();
+  roff = calloc((size_t)N + 2, 4); run(rcount);   /* reverse CSR for the backward search */
+  for (uint32_t i = 0; i < N; i++) roff[i + 2] += roff[i + 1];
+  cradj = malloc(4 * ((size_t)off[N] + 1)); run(rfill); gather(1);
+  free(roff); free(cradj); free(epos[1]); free(ewt[1]);   /* TIMING PROBE: the reverse CSR is built twice */
   roff = calloc((size_t)N + 2, 4); run(rcount);   /* reverse CSR for the backward search */
   for (uint32_t i = 0; i < N; i++) roff[i + 2] += roff[i + 1];
   cradj = malloc(4 * ((size_t)off[N] + 1)); run(rfill); gather(1);
