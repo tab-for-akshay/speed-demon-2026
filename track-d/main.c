@@ -61,7 +61,7 @@ static void *rcount(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint6
   for (uint32_t e = off[lo]; e < off[hi]; e++) __atomic_fetch_add(&roff[(cadj[e] & VM) + 2], 1, __ATOMIC_RELAXED); return NULL; }
 static void *rfill(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
   for (uint32_t u = lo; u < hi; u++) for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t p = __atomic_fetch_add(&roff[(cadj[e] & VM) + 1], 1, __ATOMIC_RELAXED); cradj[p] = pack(t, p, u, wt(0, cadj, e)); } return NULL; }
-/* per-search distances live in a small open-addressing hash map (node << 32 | distance, linear probing, at most half full)
+/* per-search distances live in a small open-addressing hash map (node << 32 | distance, linear probing, at most 3/4 full)
    instead of an N-entry array: a side of a search touches at most ~50K nodes, so the map stays around 1 MB and in cache,
    and the threads no longer carry 7 MB arrays each. tch lists the used slots so a map is cleared in O(used). */
 #define EMPTY UINT64_MAX
@@ -74,12 +74,12 @@ static inline uint32_t slot(const Side *X, uint32_t v) {
 static inline uint32_t get(const Side *X, uint32_t v) { uint64_t e = X->m[slot(X, v)]; return e == EMPTY ? UINT32_MAX : (uint32_t)e; }
 static void grow2(Side *X) {   /* double the map and reinsert what it holds */
   uint64_t *old = X->m; uint32_t n = X->n; X->bits++; X->m = malloc(8ull << X->bits); memset(X->m, 0xff, 8ull << X->bits);
-  X->tch = realloc(X->tch, 4ull << (X->bits - 1));
+  X->tch = realloc(X->tch, 3ull << X->bits);
   for (uint32_t k = 0; k < n; k++) { uint64_t e = old[X->tch[k]]; uint32_t j = slot(X, (uint32_t)(e >> 32)); X->m[j] = e; X->tch[k] = j; }
   free(old);
 }
 static inline void put(Side *X, uint32_t j, uint32_t v, uint32_t d) {
-  if (X->m[j] == EMPTY) { X->tch[X->n++] = j; X->m[j] = (uint64_t)v << 32 | d; if (2 * X->n > (1u << X->bits)) grow2(X); }
+  if (X->m[j] == EMPTY) { X->tch[X->n++] = j; X->m[j] = (uint64_t)v << 32 | d; if (4 * X->n > 3u << X->bits) grow2(X); }
   else X->m[j] = (uint64_t)v << 32 | d;
 }
 /* settle one node of side X; 1 on a 32-bit overflow */
@@ -142,7 +142,7 @@ static uint32_t *qord;
 static int qcmp(const void *a, const void *b) { uint32_t x = qs[*(const uint32_t *)a], y = qs[*(const uint32_t *)b]; return (x > y) - (x < y); }
 static void *solve(void *a) {
   (void)a; Side F = {0}, B = {0}; F.bits = B.bits = 12;
-  F.m = malloc(8 << 12); B.m = malloc(8 << 12); memset(F.m, 0xff, 8 << 12); memset(B.m, 0xff, 8 << 12); F.tch = malloc(4 << 11); B.tch = malloc(4 << 11);
+  F.m = malloc(8 << 12); B.m = malloc(8 << 12); memset(F.m, 0xff, 8 << 12); memset(B.m, 0xff, 8 << 12); F.tch = malloc(3 << 12); B.tch = malloc(3 << 12);
   for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break; i = qord[i];
     uint32_t s = qs[i], t = qt[i];
     ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : bisearch(s, t, &F, &B); }
