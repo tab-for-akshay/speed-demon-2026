@@ -30,40 +30,65 @@ static inline void rh_push(RH *h, uint64_t x) {
   if (h->n[b] == h->cap[b]) { h->cap[b] = h->cap[b] ? 2 * h->cap[b] : 256; h->a[b] = realloc(h->a[b], 8 * (size_t)h->cap[b]); }
   h->a[b][h->n[b]++] = x;
 }
-static inline int rh_pop(RH *h, uint64_t *x) {
+static inline int rh_min(RH *h, uint32_t *k) {   /* the smallest key, or 0 if empty */
   if (!h->n[0]) {
     int b = 1; while (b < 33 && !h->n[b]) b++; if (b == 33) return 0;
     uint64_t m = h->a[b][0]; for (uint32_t i = 1; i < h->n[b]; i++) if (h->a[b][i] < m) m = h->a[b][i];
     h->last = (uint32_t)(m >> 32); uint32_t c = h->n[b]; h->n[b] = 0;
     for (uint32_t i = 0; i < c; i++) rh_push(h, h->a[b][i]);
   }
-  *x = h->a[0][--h->n[0]]; return 1;
+  *k = h->last; return 1;
 }
-/* Dijkstra with 32-bit distances; returns -2 if a distance would not fit (redone in 64 bits) */
-static int64_t search(uint32_t s, uint32_t t, uint32_t *dist, uint32_t **tp, size_t *tc, RH *h) {
-  uint32_t *tch = *tp; size_t nt = 0; int64_t res = -1; uint64_t top;
-  for (int b = 0; b < 33; b++) h->n[b] = 0; h->last = 0;
-  dist[s] = 0; tch[nt++] = s; rh_push(h, s);
-  while (rh_pop(h, &top)) {
-    uint32_t u = (uint32_t)top, du = (uint32_t)(top >> 32);
-    if (du > dist[u]) continue;
-    if (u == t) { res = du; break; }
-    for (uint32_t e = off[u]; e < off[u + 1]; e++) {
-      uint64_t nd = (uint64_t)du + adj[e].w; uint32_t v = adj[e].v;
-      if (nd >= UINT32_MAX) { res = -2; goto out; }
-      if (nd >= dist[v]) continue;
-      if (dist[v] == UINT32_MAX) { if (nt == *tc) { *tc *= 2; *tp = tch = realloc(tch, *tc * 4); } tch[nt++] = v; }
-      dist[v] = (uint32_t)nd; rh_push(h, nd << 32 | v);
-    }
+/* after relabelling, an edge is one 32-bit word: head in the low VB bits, weight above; a weight too big for its field is WX there
+   and its real value sits in a short sorted list of (edge position, weight) per direction */
+static uint32_t VB, VM, WX, *cadj, *cradj, *roff, *epos[2], *ewt[2], nesc[2], *tpos[NT_MAX], *twt[NT_MAX], tn[NT_MAX], tcap[NT_MAX];
+static inline void esc(long t, uint32_t e, uint32_t w) { if (tn[t] == tcap[t]) { tcap[t] = tcap[t] ? 2 * tcap[t] : 256; tpos[t] = realloc(tpos[t], 4 * (size_t)tcap[t]); twt[t] = realloc(twt[t], 4 * (size_t)tcap[t]); } tpos[t][tn[t]] = e; twt[t][tn[t]++] = w; }
+static inline uint32_t pack(long t, uint32_t e, uint32_t v, uint32_t w) { if (w >= WX) { esc(t, e, w); w = WX; } return v | w << VB; }
+static inline uint32_t wt(int k, const uint32_t *g, uint32_t e) {
+  uint32_t w = g[e] >> VB; if (w != WX) return w;
+  uint32_t lo = 0, hi = nesc[k]; while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (epos[k][m] <= e) lo = m; else hi = m; } return ewt[k][lo];
+}
+static int pcmp(const void *a, const void *b) { const uint32_t *x = a, *y = b; return (x[0] > y[0]) - (x[0] < y[0]); }
+static void gather(int k) {   /* the threads' escaped weights, sorted by edge position */
+  uint32_t n = 0; for (int t = 0; t < NT; t++) n += tn[t];
+  uint32_t *pr = malloc(8 * (size_t)n + 8); n = 0;
+  for (int t = 0; t < NT; t++) { for (uint32_t i = 0; i < tn[t]; i++) { pr[2 * n] = tpos[t][i]; pr[2 * n++ + 1] = twt[t][i]; } tn[t] = 0; }
+  qsort(pr, n, 8, pcmp); epos[k] = malloc(4 * (size_t)n + 4); ewt[k] = malloc(4 * (size_t)n + 4); nesc[k] = n;
+  for (uint32_t i = 0; i < n; i++) { epos[k][i] = pr[2 * i]; ewt[k][i] = pr[2 * i + 1]; } free(pr);
+}
+static void *rcount(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
+  for (uint32_t e = off[lo]; e < off[hi]; e++) __atomic_fetch_add(&roff[(cadj[e] & VM) + 2], 1, __ATOMIC_RELAXED); return NULL; }
+static void *rfill(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
+  for (uint32_t u = lo; u < hi; u++) for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t p = __atomic_fetch_add(&roff[(cadj[e] & VM) + 1], 1, __ATOMIC_RELAXED); cradj[p] = pack(t, p, u, wt(0, cadj, e)); } return NULL; }
+typedef struct { uint32_t *d, *tch; size_t nt, tc; RH h; } Side;
+static inline int relax(Side *X, Side *Y, int k, const uint32_t *o, const uint32_t *g, uint64_t *mu) {   /* settle one node of side X; 1 on a 32-bit overflow */
+  uint64_t top = X->h.a[0][--X->h.n[0]]; uint32_t u = (uint32_t)top, du = (uint32_t)(top >> 32);
+  if (du > X->d[u]) return 0;
+  for (uint32_t e = o[u]; e < o[u + 1]; e++) {
+    uint64_t nd = (uint64_t)du + wt(k, g, e); uint32_t v = g[e] & VM;
+    if (nd >= UINT32_MAX) return 1;
+    if (nd >= X->d[v]) continue;
+    if (X->d[v] == UINT32_MAX) { if (X->nt == X->tc) { X->tc *= 2; X->tch = realloc(X->tch, X->tc * 4); } X->tch[X->nt++] = v; }
+    X->d[v] = (uint32_t)nd; rh_push(&X->h, nd << 32 | v);
+    if (Y->d[v] != UINT32_MAX && nd + Y->d[v] < *mu) *mu = nd + Y->d[v];
   }
-out:
-  for (size_t i = 0; i < nt; i++) dist[tch[i]] = UINT32_MAX;
+  return 0;
+}
+static int64_t bisearch(uint32_t s, uint32_t t, Side *F, Side *B) {
+  uint64_t mu = UINT64_MAX; int64_t res; uint32_t kf, kb;
+  for (int b = 0; b < 33; b++) F->h.n[b] = B->h.n[b] = 0; F->h.last = B->h.last = 0; F->nt = B->nt = 0;
+  F->d[s] = 0; F->tch[F->nt++] = s; rh_push(&F->h, s); B->d[t] = 0; B->tch[B->nt++] = t; rh_push(&B->h, t);
+  for (;;) {
+    if (!rh_min(&F->h, &kf) || !rh_min(&B->h, &kb) || (uint64_t)kf + kb >= mu) { res = mu == UINT64_MAX ? -1 : (int64_t)mu; break; }
+    if (kf <= kb ? relax(F, B, 0, off, cadj, &mu) : relax(B, F, 1, roff, cradj, &mu)) { res = -2; break; }
+  }
+  for (size_t i = 0; i < F->nt; i++) F->d[F->tch[i]] = UINT32_MAX;
+  for (size_t i = 0; i < B->nt; i++) B->d[B->tch[i]] = UINT32_MAX;
   return res;
 }
-
 /* relabel nodes so that a search touches nearby memory: each thread grows its own region by BFS from a seed of its own,
    claiming nodes with a CAS; the regions are numbered one after another, each in its BFS order */
-static uint32_t *order, *nid, *noff, *reg[NT_MAX], rn[NT_MAX]; static E *nadj;
+static uint32_t *order, *nid, *noff, *reg[NT_MAX], rn[NT_MAX];
 static void *grow(void *a) {
   long t = (long)a; uint32_t *q = reg[t] = malloc(4 * (size_t)N), n = 0, x = UINT32_MAX, s = (uint32_t)((uint64_t)N * t / NT);
   while (s < N && off[s] == off[s + 1]) s++;
@@ -74,7 +99,7 @@ static void *grow(void *a) {
   rn[t] = n; return NULL;
 }
 static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
-  for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++) nadj[o++] = (E){nid[adj[e].v], adj[e].w}; } return NULL; }
+  for (uint32_t i = lo; i < hi; i++) { uint32_t u = order[i], o = noff[i]; for (uint32_t e = off[u]; e < off[u + 1]; e++, o++) cadj[o] = pack(t, o, nid[adj[e].v], adj[e].w); } return NULL; }
 static void relabel(void) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
   run(grow);
@@ -89,19 +114,20 @@ static void relabel(void) {
   }
   noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
   for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
-  nadj = malloc(sizeof(E) * ((size_t)off[N] + 1));
-  run(pass3);
-  free(adj); free(off); free(order); adj = nadj; off = noff;
+  VB = 1; while ((1u << VB) < N) VB++; VM = (1u << VB) - 1; WX = VB >= 32 ? 0 : (uint32_t)((1ull << (32 - VB)) - 1);
+  cadj = malloc(4 * ((size_t)off[N] + 1));
+  run(pass3); gather(0);
+  free(adj); free(off); free(order); off = noff;
 }
 static uint32_t *qord;
 static int qcmp(const void *a, const void *b) { uint32_t x = qs[*(const uint32_t *)a], y = qs[*(const uint32_t *)b]; return (x > y) - (x < y); }
 static void *solve(void *a) {
-  (void)a; uint32_t *dist = malloc(4 * (size_t)N); memset(dist, 0xff, 4 * (size_t)N);
-  size_t tc = 1 << 16; uint32_t *tch = malloc(tc * 4); RH h = {0};
+  (void)a; Side F = {0}, B = {0}; F.d = malloc(4 * (size_t)N); B.d = malloc(4 * (size_t)N); memset(F.d, 0xff, 4 * (size_t)N); memset(B.d, 0xff, 4 * (size_t)N);
+  F.tc = B.tc = 1 << 16; F.tch = malloc(F.tc * 4); B.tch = malloc(B.tc * 4);
   for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break; i = qord[i];
     uint32_t s = qs[i], t = qt[i];
-    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : search(s, t, dist, &tch, &tc, &h); }
-  free(dist); free(tch); for (int b = 0; b < 33; b++) free(h.a[b]); return NULL;
+    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : bisearch(s, t, &F, &B); }
+  free(F.d); free(B.d); free(F.tch); free(B.tch); for (int b = 0; b < 33; b++) { free(F.h.a[b]); free(B.h.a[b]); } return NULL;
 }
 /* exact 64-bit Dijkstra for the few queries whose distances pass 2^32 - 1 */
 static int64_t search64(uint32_t s, uint32_t t, uint64_t *dist) {
@@ -115,7 +141,7 @@ static int64_t search64(uint32_t s, uint32_t t, uint64_t *dist) {
     if (top.d > dist[top.v]) continue;
     if (top.v == t) { res = (int64_t)top.d; break; }
     for (uint32_t e = off[top.v]; e < off[top.v + 1]; e++) {
-      uint64_t nd = top.d + adj[e].w; uint32_t v = adj[e].v; if (nd >= dist[v]) continue;
+      uint64_t nd = top.d + wt(0, cadj, e); uint32_t v = cadj[e] & VM; if (nd >= dist[v]) continue;
       if (dist[v] == UINT64_MAX) tch[nt++] = v;
       dist[v] = nd; if (hn == hc) { hc *= 2; h = realloc(h, hc * sizeof(H)); }
       size_t j = hn++; while (j) { size_t p = (j - 1) / 2; if (h[p].d <= nd) break; h[j] = h[p]; j = p; } h[j] = (H){nd, v};
@@ -144,6 +170,9 @@ int main(int argc, char **argv) {
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
   p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
   relabel();
+  roff = calloc((size_t)N + 2, 4); run(rcount);   /* reverse CSR for the backward search */
+  for (uint32_t i = 0; i < N; i++) roff[i + 2] += roff[i + 1];
+  cradj = malloc(4 * ((size_t)off[N] + 1)); run(rfill); gather(1);
   { uint8_t *h2 = calloc(N, 1); for (uint32_t i = 0; i < N; i++) h2[nid[i]] = hasin[i]; free(hasin); hasin = h2; }
   for (uint32_t i = 0; i < Q; i++) { qs[i] = nid[qs[i]]; qt[i] = nid[qt[i]]; }
   free(nid);

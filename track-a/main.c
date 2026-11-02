@@ -26,16 +26,6 @@ static long days_from_civil(int y, int m, int d) {
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1; unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return era * 146097 + (long)doe - 719468;
 }
-/* decimal digits up to the first non-digit, 8 bytes at a time (SWAR) when 8 bytes are readable, else one by one */
-static inline uint64_t num8(const char **pp, const char *lim) {
-  const char *p = *pp; uint64_t x, v = 0;
-  if (lim - p >= 8) { memcpy(&x, p, 8); uint64_t t = x - 0x3030303030303030ull, m = (t | (t + 0x7676767676767676ull)) & 0x8080808080808080ull;
-    int n = m ? __builtin_ctzll(m) >> 3 : 0;
-    if (n) { v = x << (64 - 8 * n); v = (v & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8; v = (v & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
-      *pp = p + n; return (v & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32; } }
-  while ((uint8_t)(*p - '0') < 10) v = v * 10 + (uint64_t)(*p++ - '0');
-  *pp = p; return v;
-}
 /* an endpoint is identified by a 64-bit hash of its bytes, read 8 at a time */
 static inline uint32_t intern(const char *s, uint32_t len) {
   uint64_t h = 0x9E3779B97F4A7C15ull ^ len, x; const char *p = s; uint32_t n = len;
@@ -61,7 +51,7 @@ static void *parse(void *arg) {
     const char *es = ++q; q = memchr(q, ' ', 256);
     uint32_t id = intern(es, (uint32_t)(q - es));
     uint16_t key = (uint16_t)(id | (q[1] == '5') << 15); q += 5;
-    uint32_t v = (uint32_t)num8(&q, F + FS);
+    uint32_t v = 0; while (*q != '\n') v = v * 10 + (uint32_t)(*q++ - '0');
     p = q + 1;
     Blk *b = cur[h]; if (!b || b->n == BS) { Blk *nbk = pool++; nbk->next = b; nbk->n = 0; cur[h] = head[t][h] = b = nbk; }
     b->lat[b->n] = v; b->key[b->n++] = key;
