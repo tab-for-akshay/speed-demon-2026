@@ -18,6 +18,7 @@ static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static uint32_t *ad
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
+/* a decimal number, then skip the one separator after it */
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
 /* an edge is one 32-bit word: head in the low VB bits, weight above; a weight too big for its field is WX there
    and its real value sits in a short sorted list of (edge position, weight): k = 0 forward, 1 reverse, 2 the graph before relabelling */
@@ -36,6 +37,8 @@ static void gather(int k) {   /* the threads' escaped weights, sorted by edge po
   qsort(pr, n, 8, pcmp); epos[k] = malloc(4 * (size_t)n + 4); ewt[k] = malloc(4 * (size_t)n + 4); nesc[k] = n;
   for (uint32_t i = 0; i < n; i++) { epos[k][i] = pr[2 * i]; ewt[k][i] = pr[2 * i + 1]; } free(pr);
 }
+/* CSR in two parses of the thread's chunk: pass 1 counts out-degrees and marks nodes with an in-edge; after a prefix sum,
+   pass 2 writes each edge at its tail's cursor (an atomic fetch-add, so threads can share tails) */
 static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
   while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
 static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
@@ -56,6 +59,7 @@ static inline int rh_min(RH *h, uint32_t *k) {   /* the smallest key, or 0 if em
   }
   *k = h->last; return 1;
 }
+/* reverse CSR from the relabelled graph, the same count / prefix / fill steps, each thread over its own range of tails */
 static void *rcount(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
   for (uint32_t e = off[lo]; e < off[hi]; e++) __atomic_fetch_add(&roff[(cadj[e] & VM) + 2], 1, __ATOMIC_RELAXED); return NULL; }
 static void *rfill(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT);
@@ -134,11 +138,12 @@ static void relabel(void) {
   noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
   for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
   cadj = malloc(4 * ((size_t)off[N] + 1));
-  run(pass3); gather(0);
+  run(pass3); gather(0);   /* the packed graph rewritten in label order: new offsets, heads renamed */
   free(adj); free(off); free(order); off = noff;
 }
 static uint32_t *qord;
 static int qcmp(const void *a, const void *b) { uint32_t x = qs[*(const uint32_t *)a], y = qs[*(const uint32_t *)b]; return (x > y) - (x < y); }
+/* each thread takes queries from an atomic counter; s == t is 0, a source with no out-edges or a target with no in-edges is -1 */
 static void *solve(void *a) {
   (void)a; Side F = {0}, B = {0}; F.bits = B.bits = 12;
   F.m = malloc(8 << 12); B.m = malloc(8 << 12); memset(F.m, 0xff, 8 << 12); memset(B.m, 0xff, 8 << 12); F.tch = malloc(3 << 12); B.tch = malloc(3 << 12);
@@ -189,10 +194,6 @@ int main(int argc, char **argv) {
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
   p = qf; for (uint32_t i = 0; i < Q; i++) { qs[i] = num(&p); qt[i] = num(&p); }
   relabel();
-  roff = calloc((size_t)N + 2, 4); run(rcount);   /* reverse CSR for the backward search */
-  for (uint32_t i = 0; i < N; i++) roff[i + 2] += roff[i + 1];
-  cradj = malloc(4 * ((size_t)off[N] + 1)); run(rfill); gather(1);
-  free(roff); free(cradj); free(epos[1]); free(ewt[1]);   /* TIMING PROBE: the reverse CSR is built twice */
   roff = calloc((size_t)N + 2, 4); run(rcount);   /* reverse CSR for the backward search */
   for (uint32_t i = 0; i < N; i++) roff[i + 2] += roff[i + 1];
   cradj = malloc(4 * ((size_t)off[N] + 1)); run(rfill); gather(1);

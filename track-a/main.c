@@ -47,13 +47,13 @@ static void *parse(void *arg) {
     int hh = (p[11] - '0') * 10 + (p[12] - '0');
     if (memcmp(p, lastday, 10)) { memcpy(lastday, p, 10); lastdh = days_from_civil((p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + (p[3] - '0'), (p[5] - '0') * 10 + (p[6] - '0'), (p[8] - '0') * 10 + (p[9] - '0')) * 24 - BASE_H; }
     long h = lastdh + hh;
-    const char *q = p + 28; while (*q != ' ') q++;
+    const char *q = p + 28; while (*q != ' ') q++;   /* the timestamp is 27 bytes and a space; skip the method */
     const char *es = ++q; q = memchr(q, ' ', 256);
     uint32_t id = intern(es, (uint32_t)(q - es));
-    uint16_t key = (uint16_t)(id | (q[1] == '5') << 15); q += 5;
+    uint16_t key = (uint16_t)(id | (q[1] == '5') << 15); q += 5;   /* status is 3 digits: a leading 5 flags an error */
     uint32_t v = 0; while (*q != '\n') v = v * 10 + (uint32_t)(*q++ - '0');
     p = q + 1;
-    Blk *b = cur[h]; if (!b || b->n == BS) { Blk *nbk = pool++; nbk->next = b; nbk->n = 0; cur[h] = head[t][h] = b = nbk; }
+    Blk *b = cur[h]; if (!b || b->n == BS) {   /* this thread's chain for hour h: new blocks come from its own pool */ Blk *nbk = pool++; nbk->next = b; nbk->n = 0; cur[h] = head[t][h] = b = nbk; }
     b->lat[b->n] = v; b->key[b->n++] = key;
   }
   return NULL;
@@ -82,6 +82,7 @@ static void *output(void *arg) {
   for (;;) {
     int h = __atomic_fetch_add(&nexth, 1, __ATOMIC_RELAXED); if (h >= NH) break;
     memset(cnt, 0, sizeof cnt); memset(err, 0, sizeof err); size_t n = 0;
+    /* counting sort by endpoint: count every thread's lines of this hour, then scatter latencies into one grouped array */
     for (int t = 0; t < NT; t++) for (Blk *b = head[t][h]; b; b = b->next) { n += b->n; for (uint32_t i = 0; i < b->n; i++) { cnt[b->key[i] & (TS - 1)]++; err[b->key[i] & (TS - 1)] += b->key[i] >> 15; } }
     char *o = NULL, *w = NULL;
     if (n) {
@@ -95,7 +96,7 @@ static void *output(void *arg) {
     w = o = malloc((size_t)NE * 180);
     for (int k = 0; k < NE; k++) {
       uint32_t e = order[k], c = cnt[e]; if (!c) continue;
-      uint32_t *g = v + pos[e] - c; sort_u32(g, c, tmp);
+      uint32_t *g = v + pos[e] - c; sort_u32(g, c, tmp);   /* percentiles are nearest-rank: the ceil(p * c / 100)-th smallest */
       memcpy(w, hs, 21); w += 21; memcpy(w, eps[e], epl[e]); w += epl[e]; *w++ = ' ';
       w = u2s(w, c); *w++ = ' '; w = u2s(w, g[(50ull * c + 99) / 100 - 1]); *w++ = ' '; w = u2s(w, g[(95ull * c + 99) / 100 - 1]); *w++ = ' ';
       w = u2s(w, g[(99ull * c + 99) / 100 - 1]); *w++ = ' '; w = u2s(w, err[e]); *w++ = ' '; w = u2s(w, (uint32_t)((uint64_t)err[e] * 1000000ull / c)); *w++ = '\n';
@@ -117,7 +118,7 @@ int main(int argc, char **argv) {
   NT = FS < (1 << 20) ? 1 : ncpu(); cut[0] = 0; cut[NT] = FS;   /* split at line ends */
   for (int i = 1; i < NT; i++) { size_t c = FS * (size_t)i / (size_t)NT; if (c < cut[i - 1]) c = cut[i - 1]; while (c < FS && F[c - 1] != '\n') c++; cut[i] = c; }
   run(parse);
-  for (uint32_t j = 0; j < TS; j++) if (tab[j]) order[NE++] = (uint16_t)j;
+  for (uint32_t j = 0; j < TS; j++) if (tab[j]) order[NE++] = (uint16_t)j;   /* output order: endpoints by their bytes */
   qsort(order, (size_t)NE, 2, epcmp);
   snprintf(path, sizeof path, "%s/summary.txt", out); outf = fopen(path, "wb"); if (!outf) { perror("fopen"); return 1; }
   run(output);
