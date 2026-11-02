@@ -23,14 +23,28 @@ static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = 
   while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
 static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
   while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
+/* radix heap of (distance << 32 | node); keys never drop below the last popped one */
+typedef struct { uint64_t *a[33]; uint32_t n[33], cap[33]; uint32_t last; } RH;
+static inline void rh_push(RH *h, uint64_t x) {
+  uint32_t k = (uint32_t)(x >> 32), b = k == h->last ? 0 : 32 - (uint32_t)__builtin_clz(k ^ h->last);
+  if (h->n[b] == h->cap[b]) { h->cap[b] = h->cap[b] ? 2 * h->cap[b] : 256; h->a[b] = realloc(h->a[b], 8 * (size_t)h->cap[b]); }
+  h->a[b][h->n[b]++] = x;
+}
+static inline int rh_pop(RH *h, uint64_t *x) {
+  if (!h->n[0]) {
+    int b = 1; while (b < 33 && !h->n[b]) b++; if (b == 33) return 0;
+    uint64_t m = h->a[b][0]; for (uint32_t i = 1; i < h->n[b]; i++) if (h->a[b][i] < m) m = h->a[b][i];
+    h->last = (uint32_t)(m >> 32); uint32_t c = h->n[b]; h->n[b] = 0;
+    for (uint32_t i = 0; i < c; i++) rh_push(h, h->a[b][i]);
+  }
+  *x = h->a[0][--h->n[0]]; return 1;
+}
 /* Dijkstra with 32-bit distances; returns -2 if a distance would not fit (redone in 64 bits) */
-static int64_t search(uint32_t s, uint32_t t, uint32_t *dist, uint32_t **tp, size_t *tc, uint64_t **hp, size_t *hc) {
-  uint32_t *tch = *tp; uint64_t *h = *hp; size_t nt = 0, hn = 0; int64_t res = -1;
-  dist[s] = 0; tch[nt++] = s; h[hn++] = s;
-  while (hn) {
-    uint64_t top = h[0], last = h[--hn]; size_t i = 0;
-    for (;;) { size_t l = 2 * i + 1; if (l >= hn) break; size_t m = (l + 1 < hn && h[l + 1] < h[l]) ? l + 1 : l; if (h[m] >= last) break; h[i] = h[m]; i = m; }
-    h[i] = last;
+static int64_t search(uint32_t s, uint32_t t, uint32_t *dist, uint32_t **tp, size_t *tc, RH *h) {
+  uint32_t *tch = *tp; size_t nt = 0; int64_t res = -1; uint64_t top;
+  for (int b = 0; b < 33; b++) h->n[b] = 0; h->last = 0;
+  dist[s] = 0; tch[nt++] = s; rh_push(h, s);
+  while (rh_pop(h, &top)) {
     uint32_t u = (uint32_t)top, du = (uint32_t)(top >> 32);
     if (du > dist[u]) continue;
     if (u == t) { res = du; break; }
@@ -39,10 +53,7 @@ static int64_t search(uint32_t s, uint32_t t, uint32_t *dist, uint32_t **tp, siz
       if (nd >= UINT32_MAX) { res = -2; goto out; }
       if (nd >= dist[v]) continue;
       if (dist[v] == UINT32_MAX) { if (nt == *tc) { *tc *= 2; *tp = tch = realloc(tch, *tc * 4); } tch[nt++] = v; }
-      dist[v] = (uint32_t)nd;
-      if (hn == *hc) { *hc *= 2; *hp = h = realloc(h, *hc * 8); }
-      size_t j = hn++; uint64_t key = nd << 32 | v;
-      while (j) { size_t p = (j - 1) / 2; if (h[p] <= key) break; h[j] = h[p]; j = p; } h[j] = key;
+      dist[v] = (uint32_t)nd; rh_push(h, nd << 32 | v);
     }
   }
 out:
@@ -70,11 +81,11 @@ static void relabel(uint32_t root) {
 }
 static void *solve(void *a) {
   (void)a; uint32_t *dist = malloc(4 * (size_t)N); memset(dist, 0xff, 4 * (size_t)N);
-  size_t tc = 1 << 16, hc = 1 << 16; uint32_t *tch = malloc(tc * 4); uint64_t *h = malloc(hc * 8);
+  size_t tc = 1 << 16; uint32_t *tch = malloc(tc * 4); RH h = {0};
   for (;;) { uint32_t i = __atomic_fetch_add(&qnext, 1, __ATOMIC_RELAXED); if (i >= Q) break;
     uint32_t s = qs[i], t = qt[i];
-    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : search(s, t, dist, &tch, &tc, &h, &hc); }
-  free(dist); free(tch); free(h); return NULL;
+    ans[i] = s == t ? 0 : (off[s] == off[s + 1] || !hasin[t]) ? -1 : search(s, t, dist, &tch, &tc, &h); }
+  free(dist); free(tch); for (int b = 0; b < 33; b++) free(h.a[b]); return NULL;
 }
 /* exact 64-bit Dijkstra for the few queries whose distances pass 2^32 - 1 */
 static int64_t search64(uint32_t s, uint32_t t, uint64_t *dist) {
