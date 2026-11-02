@@ -2,6 +2,7 @@
 // Built by Tab, an AI assistant, for team lead Akshay Wagh.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -45,9 +46,17 @@ static inline uint64_t num8(const char **pp, const char *lim) {
   while ((uint8_t)(*p - '0') < 10) v = v * 10 + (uint64_t)(*p++ - '0');
   *pp = p; return v;
 }
-static inline const char *quoted(const char *p, uint32_t *ulen, uint32_t *pairs) {  /* p on the opening quote */
-  const char *q = p + 1; uint32_t n = 0;
+static inline const char *quoted(const char *p, uint32_t *ulen, uint32_t *pairs) {
+  /* p on the opening quote; scans 32 bytes at a time with AVX2 (fields are short, so this beats a memchr call per quote),
+     falling back to memchr in the last 64 bytes of the file so no load runs past the mapping */
+  const char *q = p + 1; uint32_t n = 0; const __m256i qu = _mm256_set1_epi8('"');
+  for (; F + FS - q >= 64; q += 32) {
+    uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)q), qu));
+    while (m) { int i = __builtin_ctz(m); if (q[i + 1] != '"') { q += i; goto done; }
+      n++; m &= m - 1; if (i < 31) m &= m - 1; else { q += 1; break; } }   /* a "" pair: skip both quotes (the second may open the next block) */
+  }
   for (;;) { q = memchr(q, '"', (size_t)(F + FS - q)); if (q[1] != '"') break; n++; q += 2; }
+done:
   *ulen = (uint32_t)(q - p - 1) - n; *pairs = n; return q + 1;
 }
 static void *work(void *arg) {
