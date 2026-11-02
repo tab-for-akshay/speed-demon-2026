@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -19,10 +20,20 @@ static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
-static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
-static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
+/* CSR build: pass 1 counts edges per tail (atomics) and per thread per bucket of 2^KB tails; pass 2 appends each edge to its
+   thread's run inside its bucket (bucket b holds exactly the edges of tails b * 2^KB ... in CSR order, so the runs are written
+   sequentially); "place" puts each bucket's edges, one thread per bucket, with writes that stay inside the bucket */
+static uint32_t VB, VM, *off2, *bc[NT_MAX], NB, KB;   /* VB: bits for a node id, VM its mask */
+ static E *tmp;   /* tmp edge: head | (tail mod 2^KB) << VB, weight */
+static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint32_t *c = bc[i];
+  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; c[u >> KB]++; } return NULL; }
+static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint32_t *c = bc[i];
+  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); tmp[c[u >> KB]++] = (E){v | (u & ((1u << KB) - 1)) << VB, w}; } return NULL; }
+static void *place(void *a) { long t = (long)a;
+  for (uint32_t b = (uint32_t)(NB * t / NT); b < NB * (t + 1) / NT; b++) {
+    uint32_t lo = b << KB, hi = lo + (1u << KB) < N ? lo + (1u << KB) : N;
+    for (uint32_t k = off[lo]; k < off[hi]; k++) adj[off2[lo | tmp[k].v >> VB]++] = (E){tmp[k].v & VM, tmp[k].w}; }
+  return NULL; }
 /* radix heap of (distance << 32 | node); keys never drop below the last popped one */
 typedef struct { uint64_t *a[33]; uint32_t n[33], cap[33]; uint32_t last; } RH;
 static inline void rh_push(RH *h, uint64_t x) {
@@ -41,7 +52,7 @@ static inline int rh_min(RH *h, uint32_t *k) {   /* the smallest key, or 0 if em
 }
 /* after relabelling, an edge is one 32-bit word: head in the low VB bits, weight above; a weight too big for its field is WX there
    and its real value sits in a short sorted list of (edge position, weight) per direction */
-static uint32_t VB, VM, WX, *cadj, *cradj, *roff, *epos[2], *ewt[2], nesc[2], *tpos[NT_MAX], *twt[NT_MAX], tn[NT_MAX], tcap[NT_MAX];
+static uint32_t WX, *cadj, *cradj, *roff, *epos[2], *ewt[2], nesc[2], *tpos[NT_MAX], *twt[NT_MAX], tn[NT_MAX], tcap[NT_MAX];
 static inline void esc(long t, uint32_t e, uint32_t w) { if (tn[t] == tcap[t]) { tcap[t] = tcap[t] ? 2 * tcap[t] : 256; tpos[t] = realloc(tpos[t], 4 * (size_t)tcap[t]); twt[t] = realloc(twt[t], 4 * (size_t)tcap[t]); } tpos[t][tn[t]] = e; twt[t][tn[t]++] = w; }
 static inline uint32_t pack(long t, uint32_t e, uint32_t v, uint32_t w) { if (w >= WX) { esc(t, e, w); w = WX; } return v | w << VB; }
 static inline uint32_t wt(int k, const uint32_t *g, uint32_t e) {
@@ -114,7 +125,6 @@ static void relabel(void) {
   }
   noff = malloc(4 * ((size_t)N + 1)); noff[0] = 0;
   for (uint32_t i = 0; i < N; i++) noff[i + 1] = noff[i] + off[order[i] + 1] - off[order[i]];
-  VB = 1; while ((1u << VB) < N) VB++; VM = (1u << VB) - 1; WX = VB >= 32 ? 0 : (uint32_t)((1ull << (32 - VB)) - 1);
   cadj = malloc(4 * ((size_t)off[N] + 1));
   run(pass3); gather(0);
   free(adj); free(off); free(order); off = noff;
@@ -155,16 +165,20 @@ static char *mapfile(const char *path, size_t *sz) { int fd = open(path, O_RDONL
 int main(int argc, char **argv) {
   const char *data = argc > 1 ? argv[1] : "/data", *out = argc > 2 ? argv[2] : "/out"; char path[4096];
   NT = ncpu();
+  mallopt(M_MMAP_THRESHOLD, 1 << 20);   /* big arrays always get their own mapping and go back to the kernel when freed */
   snprintf(path, sizeof path, "%s/graph.txt", data); G = mapfile(path, &GS);
   const char *p = G; N = num(&p); num(&p); size_t body = (size_t)(p - G);
   cb[0] = body; cb[NT] = GS;
   for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
   off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
+  VB = 1; while ((1u << VB) < N) VB++; VM = (1u << VB) - 1; WX = (uint32_t)((1ull << (32 - VB)) - 1); KB = 32 - VB; NB = (N >> KB) + 1;
+  for (int t = 0; t < NT; t++) bc[t] = calloc(NB, 4);
   run(pass1);
   for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
-  adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
-  run(pass2);   /* leaves off[u] = end of u = start of u+1: shift back */
-  memmove(off + 1, off, 4 * (size_t)N); off[0] = 0;
+  for (uint32_t b = 0; b < NB; b++) { uint32_t s = off[b << KB < N ? b << KB : N]; for (int t = 0; t < NT; t++) { uint32_t x = bc[t][b]; bc[t][b] = s; s += x; } }
+  tmp = malloc(sizeof(E) * ((size_t)off[N] + 1)); run(pass2);
+  adj = malloc(sizeof(E) * ((size_t)off[N] + 1)); off2 = malloc(4 * ((size_t)N + 1)); memcpy(off2, off, 4 * ((size_t)N + 1));
+  run(place); free(tmp); free(off2); for (int t = 0; t < NT; t++) free(bc[t]);
   size_t qsz; snprintf(path, sizeof path, "%s/queries.txt", data); const char *qf = mapfile(path, &qsz);
   Q = 0; for (size_t i = 0; i < qsz; i++) Q += qf[i] == '\n';
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
