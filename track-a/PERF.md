@@ -30,12 +30,22 @@ Best so far: step 5, K 31.93 (run-4283afd0c7da), from K 9.87 at step 1. Its T mo
 | 5 (re-run) | Same step-5 code (the push changed track C or D) | 39e7f02 | run-4283afd0c7da | 0.0376 | 38.9 | 326 | 31.93 | 75.2 |
 | 5 (re-run) | Same step-5 code (the push changed track C or D) | 28f932d | run-582d6f1e2cde | 0.0495 | 38.4 | 326 | 27.90 | 72.3 |
 | 5 (re-run) | Same step-5 code (the push changed track C or D) | de0fbbd | run-0443dfba3868 | 0.0386 | 38.4 | 326 | 31.59 | 75.0 |
+| 5 (re-run) | Same step-5 code (the push changed track D) | a01b95b | run-a2a9b5c2d3d1 | 0.0474 | 40.2 | 326 | 28.25 | 72.6 |
 | 7 (re-run) | Step-7 code measured again: with 12 runs of step 5 showing two clusters (below), one run could not decide it | 021d538 | run-537fe27f40d9 | 0.0371 | 38.5 | 345 | 31.92 | 75.2 |
+| 7 (re-run) | Step-7 code measured again | d5b484e | run-5bbd77b0b02f | 0.0529 | 38.7 | 345 | 26.71 | 71.3 |
+| 7 (re-run) | Step-7 code measured again | 3251760 | run-98ff6b02e545 | 0.0479 | 38.6 | 345 | 28.09 | 72.4 |
+| 7 (re-run) | Step-7 code measured again | 42a3af6 | run-1894b4eb56f1 | 0.0395 | 38.6 | 345 | 30.94 | 74.5 |
+| 5 (re-run) | Back to step 5: in five runs step 7 was not clearly faster (below) and costs 19 lines | a74a66e | run-9f48691564af | 0.0494 | 38.6 | 326 | 27.90 | 72.3 |
+| 5 (re-run) | Same step-5 code (the push changed track C or D) | f733cfd | run-c3d8d53fe162 | 0.0380 | 38.8 | 326 | 31.77 | 75.1 |
+| 5 (re-run) | Same step-5 code (the push changed track C or D) | 8f0988f | run-1ce71d7b5a31 | 0.0595 | 40.6 | 326 | 25.17 | 70.0 |
+| 5 (re-run) | Same step-5 code (the push changed track C or D) | 4e1e4a5 | run-e5d9425dd8cc | 0.0495 | 38.8 | 326 | 27.84 | 72.2 |
+| 5 (re-run) | Same machine code, comments added on the non-obvious steps | f0f84f6 | run-fcaf16e33baf | 0.0379 | 39.1 | 326 | 31.76 | 75.1 |
+| 8 (experiment, lost) | Build with `-O3` instead of `-O2` (all tracks in one push) | ccd28ec | run-d09764a331d2 | 0.0509 | 38.6 | 326 | 27.48 | 72.0 |
 
 
 ## Same code, many runs: how noisy is T on this track?
 
-Every push re-runs all three tracks, so the step-5 code was measured 12 times while I worked on C and D. Sorted T (s): 0.0376, 0.0380, 0.0381, 0.0382, 0.0386, 0.0386, 0.0419, 0.0487, 0.0495, 0.0509, 0.0555, 0.0615. Two clusters: six runs at 0.038 s, five at 0.049-0.062 s, one between, with M steady at 38-41 MB. Tracks C and D in the same pushes moved by 2-3%, so the slow cluster is specific to this track. My best guess is the 9.7 MB output: A is the only track that writes megabytes, and the runs are short enough that a stall in the page-cache write path shows up. I have not proven it. The practical consequence: on this track one run cannot separate a 10% change from noise, which matters for steps 6 and 7 below.
+Every push re-runs all three tracks, so the step-5 code was measured 18 times while I worked on C and D. Sorted T (s): 0.0376, 0.0379, 0.0380, 0.0380, 0.0381, 0.0382, 0.0386, 0.0386, 0.0419, 0.0474, 0.0487, 0.0494, 0.0495, 0.0495, 0.0509, 0.0555, 0.0595, 0.0615. Two clusters: eight runs at 0.038 s and nine at 0.047-0.062 s, with M steady at 38-41 MB. Tracks C and D in the same pushes usually moved by 2-3%, so the slow cluster is mostly specific to this track. My best guess is the 9.7 MB output: A is the only track that writes megabytes, and the runs are short enough that a stall in the page-cache write path shows up. I have not proven it. The practical consequence: on this track one run cannot separate a 10% change from noise, so step 7 got five runs before I decided (0.0371, 0.0395, 0.0479, 0.0486, 0.0529 s: the same two clusters, no clear shift).
 
 ## How the final code works
 
@@ -52,5 +62,6 @@ Step 4 passed every gate, but a stress test I ran afterwards (the same input at 
 
 - **Step 3, parallel merge (run-d3d10deaef60): K 17.20 → 14.86.** It was slower (0.104 s → 0.118 s), not faster: the atomic adds on shared per-group counters contend between threads (the hot endpoints are a heavy Zipf head, so many threads hit the same counters), and the extra per-line global key array raised peak memory from 56.5 MB to 81.2 MB. It also added 23 lines. Reverted to the step-2 code in the next commit. Lesson: on this data the serial merge was not the bottleneck worth paying memory for; the next attempt has to cut memory and passes, not add threads to a cheap pass.
 - **Step 6, method-length table and AVX2 endpoint scan (run-0b454683cc02): K 29.93 → 28.20 on its one run.** T 0.0476 s, which falls in the slow cluster above, so I cannot claim it was slower; it was not visibly faster, and it added 20 lines (S 326 → 346, −0.9% on K). Reverted.
-- **Step 7, SWAR latency parsing (run-5ea2257b46f3): K 31.88 → 27.99 on its one run.** Same story: T 0.0486 s (slow cluster), +19 lines. The same SWAR parse won on track C, where it replaced three integer loops per record; here it replaces one, and the line is dominated by the endpoint lookup. Reverted.
+- **Step 7, SWAR latency parsing (run-5ea2257b46f3, then four more runs): K 31.88 → 27.99 on its first run.** T 0.0486 s fell in the slow cluster, so I measured it four more times (run-537fe27f40d9, run-5bbd77b0b02f, run-98ff6b02e545, run-1894b4eb56f1). Its fastest run (0.0371 s) beat step 5's fastest (0.0376 s) by 1%, less than the 19 extra lines cost (−0.9% on K), and its median was no better. The same SWAR parse won on track C, where it replaced three integer loops per record; here it replaces one, and a line's time goes to the endpoint lookup. Reverted.
+- **Step 8, `-O3` (run-d09764a331d2): T 0.0509 s, slow cluster; on tracks C and D the same push was slower too** (see their logs), so all three went back to `-O2`.
 - **Not pushed: quickselect for the three percentiles instead of sorting each group.** Locally the output phase went from 0.063 s to 0.077 s (single thread): three branchy partitions per group lose to a branch-free radix sort.

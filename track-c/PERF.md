@@ -29,6 +29,17 @@ Best so far: step 7, K 32.83 (run-ce057353460e), from K 2.99 at step 1.
 | 7 (re-run) | Same step-7 code (the push changed track D) | 39e7f02 | run-18967dc055b8 | 0.0418 | 10.0 | 335 | 32.22 | 75.4 |
 | 7 (re-run) | Same step-7 code (the push changed track D) | 28f932d | run-28baf08bddda | 0.0419 | 9.9 | 335 | 32.25 | 75.4 |
 | 7 (re-run) | Same step-7 code (the push changed track D) | de0fbbd | run-ea36ee3696a6 | 0.0409 | 10.2 | 335 | 32.43 | 75.5 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | a01b95b | run-0eeb77125c33 | 0.0422 | 10.2 | 335 | 31.95 | 75.2 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | 021d538 | run-de33faf7ca1a | 0.0469 | 10.0 | 335 | 30.43 | 74.2 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | d5b484e | run-126d9417681d | 0.0412 | 10.4 | 335 | 32.24 | 75.4 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | 3251760 | run-490c0ff1f5b7 | 0.0499 | 10.1 | 335 | 29.45 | 73.5 |
+| 9 (experiment, lost) | Lookup pipeline spaced two records per stage (slot prefetched, looked up two records later, bit set two after that) | 42a3af6 | run-e59cac1be816 | 0.0438 | 10.5 | 338 | 31.20 | 74.7 |
+| 7 (re-run) | Back to step 7 | a74a66e | run-5eaab58cb008 | 0.0411 | 10.0 | 335 | 32.53 | 75.6 |
+| 10 (experiment, lost) | Structural index: per 64-byte block, AVX2 masks of quotes, commas and LFs, a prefix XOR of the quote bits for inside-quote bytes; fields from comma/LF positions, quoted lengths from a popcount of quote bits | f733cfd | run-58441018d3f7 | 0.0464 | 9.7 | 383 | 30.20 | 74.0 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | 8f0988f | run-8804c52fb35b | 0.0507 | 10.5 | 335 | 29.00 | 73.1 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | 4e1e4a5 | run-dbb63956f952 | 0.0414 | 10.0 | 335 | 32.43 | 75.5 |
+| 7 (re-run) | Same step-7 code (the push changed track A or D) | f0f84f6 | run-c23ba920dfd4 | 0.0407 | 10.0 | 335 | 32.69 | 75.7 |
+| 11 (experiment, lost) | Build with `-O3` instead of `-O2` (all tracks in one push) | ccd28ec | run-6b8d679a8817 | 0.0421 | 10.3 | 335 | 31.94 | 75.2 |
 
 
 ## How the final code works
@@ -43,4 +54,7 @@ Best so far: step 7, K 32.83 (run-ce057353460e), from K 2.99 at step 1.
 
 - **Step 5, bits set without atomics (run-d37dde1ff289): K 28.95 → 18.87.** Each thread buffered (country, name) pairs per round, then threads set bits for their own slice of countries between barriers. No atomics, but the pair buffers raised memory from 10.5 MB to 25.9 MB, and the rounds and barriers made it slower (0.053 s → 0.084 s): atomic ORs on mostly uncontended words are cheap, waiting for the slowest thread every round is not.
 - **Step 8, AVX2 quote scanning (run-cf5f74814d67): K 32.83 → 32.24.** T moved within noise (0.0411 s → 0.0409 s) and the code grew 22 lines (S 335 → 357). Names average 10 bytes and notes 22, so glibc's `memchr` (itself AVX2) is already in the right ballpark; an inline 32-byte scan saved a call per field and nothing measurable. Reverted.
+- **Step 9, a deeper lookup pipeline (run-e59cac1be816): K 32.69 → 31.20.** Spacing the stages two records apart gives each cache miss twice as long to land; T went the wrong way (0.041 s → 0.044 s). One record of parsing already covers most of the miss, and the deeper ring costs registers in the hottest loop.
+- **Step 10, SIMD structural index (run-58441018d3f7): K 32.69 → 30.20.** The textbook fast-CSV design: classify 64 bytes at a time with AVX2, find inside-quote bytes with a prefix XOR of the quote mask, then read every field from comma and LF positions, with a quoted field's unescaped length taken from a popcount of its quote bits, so names and notes are never walked. It was correct first time on every seed and edge case (including a final record without terminator), and single-threaded it beat step 7 locally. On the board, with 12 threads on 6 cores, it was slower (0.041 s → 0.046 s) and 48 lines longer. My reading: two hyperthreads share one core's vector units, and step 7's scalar loop with its two overlapped cache misses already kept each core busy; classifying every byte adds work that the scalar parser skips (it jumps over names and notes with `memchr`). Reverted.
+- **Step 11, `-O3` (run-6b8d679a8817): T 0.0407 s → 0.0421 s,** and slower on D as well. Back to `-O2`.
 - **The same SWAR integer parse lost on tracks A and D** (see their logs). It won here because a C record has three integers and little else to do.

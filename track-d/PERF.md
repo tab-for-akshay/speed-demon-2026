@@ -2,7 +2,7 @@
 
 Every number below is from the live board (i5-13500, 6 P-cores / 12 threads, turbo off), read from board.json. M is the kernel's peak memory in MB (10^6 bytes), S is the code lines scc counts after clang-format (LLVM style); an S written ~N was not recorded at the time and is back-computed from the run's T, M and K. Points = 50 x log10(K). Every row is one board run; "re-run" rows are the same code measured again by a later push (that push changed another track).
 
-Best so far: step 19, K 18.55 (run-51beaa09a57e), from K 5.40 at step 1.
+Best so far: step 19, K 18.91 (run-02170a3cf2ef), from K 5.40 at step 1.
 
 | Step | Change | Commit | Run ID | T (s) | M (MB) | S | K | Points |
 |---|---|---|---|---|---|---|---|---|
@@ -33,6 +33,15 @@ Best so far: step 19, K 18.55 (run-51beaa09a57e), from K 5.40 at step 1.
 | 18 | Step 16 on 12 threads, edges packed into 32 bits from the first CSR on, reverse graph freed before the forward-only 64-bit fallback, `malloc_trim` after the searches | de0fbbd | run-8b07411d6789 | 0.2461 | 97.2 | 589 | 18.09 | 62.9 |
 | 19 | Hash maps grow at 3/4 full instead of 1/2 | a01b95b | run-51beaa09a57e | 0.2443 | 87.2 | 589 | 18.55 | 63.4 |
 | 20 (experiment, lost) | Parse graph.txt once: pass 1 keeps each thread's edges (12 bytes each) in a buffer, pass 2 places them | 021d538 | run-305af0997427 | 0.2668 | 122.5 | 596 | 16.55 | 60.9 |
+| 19 (re-run) | Back to step 19 | d5b484e | run-299dabb2cbfa | 0.2385 | 85.7 | 589 | 18.84 | 63.8 |
+| 21 (experiment) | Hash-map slot keeps groups of 8 consecutive labels in one cache line, groups spread by a multiplicative hash (this run was slow on every track: C, unchanged, 0.0499 s) | 3251760 | run-167469932e83 | 0.2503 | 85.8 | 588 | 18.39 | 63.2 |
+| 21 (re-run) | Same step-21 code | 42a3af6 | run-8a5d3256ba79 | 0.2449 | 85.4 | 588 | 18.61 | 63.5 |
+| 19 (re-run) | Back to step 19 (step 21 equal within noise; the simpler hash stays), unused struct removed | a74a66e | run-1ef3258833d8 | 0.2415 | 87.4 | 586 | 18.66 | 63.5 |
+| 19 (re-run) | Same code | f733cfd | run-02170a3cf2ef | 0.2371 | 85.8 | 586 | 18.91 | 63.8 |
+| probe | Timing probe on step-19 code: the region growing runs twice (this run was slow on every track) | 8f0988f | run-8e1a814cabe2 | 0.2533 | 106.2 | 590 | 17.51 | 62.2 |
+| probe | Timing probe on step-19 code: the reverse CSR is built twice | 4e1e4a5 | run-82010eba12e7 | 0.2789 | 85.6 | 597 | 17.39 | 62.0 |
+| 19 (re-run) | Same machine code, comments added on the non-obvious steps | f0f84f6 | run-de58b6261c55 | 0.2397 | 85.5 | 586 | 18.82 | 63.7 |
+| 22 (experiment, lost) | Build with `-O3` instead of `-O2` (all tracks in one push) | ccd28ec | run-ce25990f2d0a | 0.2756 | 86.7 | 586 | 17.50 | 62.1 |
 
 
 ## Where the time goes
@@ -42,7 +51,9 @@ The board is the only machine that matters (this sandbox is a loaded 4-CPU VM wh
 - Running every query search twice (run-c18a0b7dda83): T 0.251 s → 0.355 s, so the 2,000 bidirectional searches cost about **0.10 s** on 6 threads, 40% of the run.
 - One extra parallel parse of the 92 MB graph.txt (run-c7daeb5540d9): T 0.251 s → 0.267 s, so one parse costs about **0.016 s**. Two parses (count, then fill) are ~0.03 s.
 
-That left ~0.11 s in building the CSR, relabelling and the reverse CSR. Step 14 (sequential bucketed writes instead of random scatter) cut that phase by 4× locally and did nothing on the board, and step 15 (making the remaining serial loops parallel) did nothing either: on bare metal those phases are not the bottleneck the VM suggests. The searches were, and they were bound by memory: two 7 MB distance arrays per thread, touched at random. Step 16 replaced them with a hash map that stays in cache, which made the searches faster and memory smaller at the same time.
+Two more probes on the step-19 code (hash-map searches): building the reverse CSR twice (run-82010eba12e7) added **~0.04 s** (0.240 s → 0.279 s), and growing the relabelling regions twice (run-8e1a814cabe2) added at most ~0.015 s, on a run that was slow on every track.
+
+At step 13 that left ~0.11 s in building the CSR, relabelling and the reverse CSR. Step 14 (sequential bucketed writes instead of random scatter) cut that phase by 4× locally and did nothing on the board, and step 15 (making the remaining serial loops parallel) did nothing either: on bare metal those phases are not the bottleneck the VM suggests. The searches were, and they were bound by memory: two 7 MB distance arrays per thread, touched at random. Step 16 replaced them with a hash map that stays in cache, which made the searches faster and memory smaller at the same time.
 
 ## How the final code works
 
@@ -61,5 +72,7 @@ That left ~0.11 s in building the CSR, relabelling and the reverse CSR. Step 14 
 - **Step 10, SWAR integer parsing (run-7487aed7f489): K 15.29 → 15.19.** T was unchanged to the millisecond (0.3068 s → 0.3069 s); the parse is not where D spends its time, and 21 more lines cost K. The same change won on track C, where parsing is most of the work.
 - **Step 14, bucketed CSR build (run-4d860f321700, re-run run-f97fd2ea9a44): K 16.65 → 16.28.** See "Where the time goes": 4× faster locally, nothing on the board, 35 more lines.
 - **Step 15, parallel serial steps (run-cf5693ad0a04): K 16.65 → 16.61.** T identical (0.2509 s → 0.2509 s), 21 more lines.
-- **Step 20, one parse instead of two (run-305af0997427): K 18.55 → 16.55.** The probe said a parse costs 0.016 s, so keeping 60 MB of parsed edges instead of parsing again looked like a small win. It was slower (0.244 s → 0.267 s) and memory jumped to 122.5 MB, far above the 92 MB I measured locally: the edge buffers were reserved generously and only the pages written should count, but the board most likely backs large allocations with transparent huge pages, so reserved-but-untouched memory was charged after all. Reverted; parsing twice from the page cache is cheaper than storing the result.
+- **Step 20, one parse instead of two (run-305af0997427): K 18.55 → 16.55.** The probe said a parse costs 0.016 s, so keeping 60 MB of parsed edges instead of parsing again looked like a small win. It was slower (0.244 s → 0.267 s) and memory jumped to 122.5 MB, far above the 92 MB I measured locally: the edge buffers were reserved generously and only the pages written should count, but the board evidently backs large allocations with huge pages, so reserved-but-untouched memory was charged after all. Reverted; parsing twice from the page cache is cheaper than storing the result.
+- **Step 21, cache-line groups in the hash map (run-167469932e83, run-8a5d3256ba79): K 18.39 and 18.61 against step 19's 18.55-18.91.** Keeping 8 consecutive labels in one cache line should help, since a node's neighbours have nearby labels; within the noise it made no difference, so the plain multiplicative hash stayed.
+- **Step 22, `-O3` (run-ce25990f2d0a): T 0.240 s → 0.276 s.** Slower on C too. Back to `-O2`.
 - **Step 17, hash-map searches on 6 threads (run-bf9686e42729): K 17.78 → 17.39.** At step 13 halving the search threads paid, because each thread carried 14 MB of distance arrays. With 1 MB hash maps the memory saved was small (112 → 96 MB) and the time lost was not (0.241 s → 0.268 s), so the searches went back to all 12 threads.
