@@ -66,8 +66,7 @@ static void *rfill(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64
 #define EMPTY UINT64_MAX
 typedef struct { uint64_t *m; uint32_t *tch, bits, n; RH h; } Side;
 static inline uint32_t slot(const Side *X, uint32_t v) {
-  /* groups of 8 consecutive labels share a cache line (neighbours have nearby labels); the groups are spread by a multiplicative hash */
-  uint32_t mask = (1u << X->bits) - 1, i = ((((v >> 3) * 0x9E3779B1u) >> (35 - X->bits)) << 3 | (v & 7)) & mask;
+  uint32_t i = (v * 0x9E3779B1u) >> (32 - X->bits), mask = (1u << X->bits) - 1;
   while (X->m[i] != EMPTY && (uint32_t)(X->m[i] >> 32) != v) i = (i + 1) & mask;
   return i;
 }
