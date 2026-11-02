@@ -122,6 +122,7 @@ static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64
 static void relabel(void) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
   run(grow);
+  for (int t = 0; t < NT; t++) free(reg[t]); memset(nid, 0xff, 4 * (size_t)N); run(grow);   /* TIMING PROBE: the region growing runs twice */
   uint32_t tail = 0;
   for (int t = 0; t < NT; t++) { for (uint32_t i = 0; i < rn[t]; i++) order[tail + i] = reg[t][i]; tail += rn[t]; free(reg[t]); }
   for (uint32_t i = 0; i < tail; i++) nid[order[i]] = i;
