@@ -14,14 +14,13 @@
 #include <unistd.h>
 #define NT_MAX 64
 static int ncpu(void) { cpu_set_t s; CPU_ZERO(&s); int n = sched_getaffinity(0, sizeof s, &s) ? 1 : CPU_COUNT(&s); return n < 1 ? 1 : n > NT_MAX ? NT_MAX : n; }  /* the CPUs this container may use (12 on the board), not every CPU online (20) */
-typedef struct { uint32_t v, w; } E;
 static uint32_t N, Q, *off, *qs, *qt; static uint8_t *hasin; static uint32_t *adj; static int64_t *ans;
 static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
 /* an edge is one 32-bit word: head in the low VB bits, weight above; a weight too big for its field is WX there
-   and its real value sits in a short sorted list of (edge position, weight) per direction */
+   and its real value sits in a short sorted list of (edge position, weight): k = 0 forward, 1 reverse, 2 the graph before relabelling */
 static uint32_t VB, VM, WX, *cadj, *cradj, *roff, *epos[3], *ewt[3], nesc[3], *tpos[NT_MAX], *twt[NT_MAX], tn[NT_MAX], tcap[NT_MAX];
 static inline void esc(long t, uint32_t e, uint32_t w) { if (tn[t] == tcap[t]) { tcap[t] = tcap[t] ? 2 * tcap[t] : 256; tpos[t] = realloc(tpos[t], 4 * (size_t)tcap[t]); twt[t] = realloc(twt[t], 4 * (size_t)tcap[t]); } tpos[t][tn[t]] = e; twt[t][tn[t]++] = w; }
 static inline uint32_t pack(long t, uint32_t e, uint32_t v, uint32_t w) { if (w >= WX) { esc(t, e, w); w = WX; } return v | w << VB; }
@@ -67,7 +66,8 @@ static void *rfill(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64
 #define EMPTY UINT64_MAX
 typedef struct { uint64_t *m; uint32_t *tch, bits, n; RH h; } Side;
 static inline uint32_t slot(const Side *X, uint32_t v) {
-  uint32_t i = (v * 0x9E3779B1u) >> (32 - X->bits), mask = (1u << X->bits) - 1;
+  /* groups of 8 consecutive labels share a cache line (neighbours have nearby labels); the groups are spread by a multiplicative hash */
+  uint32_t mask = (1u << X->bits) - 1, i = ((((v >> 3) * 0x9E3779B1u) >> (35 - X->bits)) << 3 | (v & 7)) & mask;
   while (X->m[i] != EMPTY && (uint32_t)(X->m[i] >> 32) != v) i = (i + 1) & mask;
   return i;
 }
