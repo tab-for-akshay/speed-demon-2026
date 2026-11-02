@@ -19,10 +19,15 @@ static const char *G; static size_t GS; static int NT; static uint32_t qnext;
 static size_t cb[NT_MAX + 1];
 static void run(void *(*f)(void *)) { pthread_t th[NT_MAX]; for (long i = 0; i < NT; i++) pthread_create(&th[i], NULL, f, (void *)i); for (int i = 0; i < NT; i++) pthread_join(th[i], NULL); }
 static inline uint32_t num(const char **pp) { const char *p = *pp; uint32_t v = *p++ - '0'; while (*p >= '0') v = v * 10 + (uint32_t)(*p++ - '0'); *pp = p + 1; return v; }
-static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED); hasin[v] = 1; } return NULL; }
-static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1];
-  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[__atomic_fetch_add(&off[u], 1, __ATOMIC_RELAXED)] = (E){v, w}; } return NULL; }
+/* CSR build without atomics: each thread counts its own edges per tail, the counts become per-thread write positions */
+static uint32_t *cnt[NT_MAX], rsum[NT_MAX];
+static void *pass1(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint32_t *c = cnt[i] = calloc((size_t)N + 1, 4);
+  while (p < e) { uint32_t u = num(&p), v = num(&p); while (*p++ != '\n'); c[u]++; hasin[v] = 1; } return NULL; }
+static void *scan(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64_t)N * t / NT), hi = (uint32_t)((uint64_t)N * (t + 1) / NT), s = 0;
+  if (!off[N + 1]) { for (uint32_t u = lo; u < hi; u++) for (int k = 0; k < NT; k++) s += cnt[k][u]; rsum[t] = s; return NULL; }
+  s = rsum[t]; for (uint32_t u = lo; u < hi; u++) { off[u] = s; for (int k = 0; k < NT; k++) { uint32_t x = cnt[k][u]; cnt[k][u] = s; s += x; } } return NULL; }
+static void *pass2(void *a) { long i = (long)a; const char *p = G + cb[i], *e = G + cb[i + 1]; uint32_t *c = cnt[i];
+  while (p < e) { uint32_t u = num(&p), v = num(&p), w = num(&p); adj[c[u]++] = (E){v, w}; } return NULL; }
 /* radix heap of (distance << 32 | node); keys never drop below the last popped one */
 typedef struct { uint64_t *a[33]; uint32_t n[33], cap[33]; uint32_t last; } RH;
 static inline void rh_push(RH *h, uint64_t x) {
@@ -64,26 +69,21 @@ out:
 /* relabel nodes in BFS order so that a search touches nearby memory: a level-synchronous parallel BFS,
    each thread appending what it discovers to its own buffer, the buffers concatenated in thread order per level */
 static uint32_t *order, *nid, *noff, *lbuf[NT_MAX], lcnt[NT_MAX], qlo, qhi, qtail; static E *nadj;
-static volatile int bar_n, bar_sense;
-static void barrier(int *sense) {
-  *sense = !*sense;
-  if (__atomic_add_fetch(&bar_n, 1, __ATOMIC_ACQ_REL) == NT) { bar_n = 0; __atomic_store_n(&bar_sense, *sense, __ATOMIC_RELEASE); }
-  else while (__atomic_load_n(&bar_sense, __ATOMIC_ACQUIRE) != *sense) __builtin_ia32_pause();
-}
+static pthread_barrier_t bar;
 static void *bfs(void *a) {
-  long t = (long)a; int sense = 0; uint32_t *buf = lbuf[t];
+  long t = (long)a; uint32_t *buf = lbuf[t];
   for (;;) {
     uint32_t lo = qlo, hi = qhi, n = hi - lo, b = lo + (uint32_t)((uint64_t)n * t / NT), e = lo + (uint32_t)((uint64_t)n * (t + 1) / NT), c = 0;
     if (n == 0) break;
     for (uint32_t i = b; i < e; i++) { uint32_t u = order[i]; if (i + 4 < e) __builtin_prefetch(&off[order[i + 4]]);
       for (uint32_t k = off[u]; k < off[u + 1]; k++) { uint32_t v = adj[k].v, x = UINT32_MAX;
         if (nid[v] == UINT32_MAX && __atomic_compare_exchange_n(&nid[v], &x, UINT32_MAX - 1, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) buf[c++] = v; } }
-    lcnt[t] = c; barrier(&sense);
+    lcnt[t] = c; pthread_barrier_wait(&bar);
     uint32_t o = hi; for (long s = 0; s < t; s++) o += lcnt[s];
     for (uint32_t i = 0; i < c; i++) { order[o + i] = buf[i]; nid[buf[i]] = o + i; }
-    barrier(&sense);
+    pthread_barrier_wait(&bar);
     if (t == 0) { uint32_t tot = 0; for (long s = 0; s < NT; s++) tot += lcnt[s]; qlo = hi; qhi = hi + tot; }
-    barrier(&sense);
+    pthread_barrier_wait(&bar);
   }
   return NULL;
 }
@@ -92,11 +92,12 @@ static void *pass3(void *a) { long t = (long)a; uint32_t lo = (uint32_t)((uint64
 static void relabel(uint32_t root) {
   order = malloc(4 * (size_t)N); nid = malloc(4 * (size_t)N); memset(nid, 0xff, 4 * (size_t)N);
   for (int t = 0; t < NT; t++) lbuf[t] = malloc(4 * (size_t)N);
+  pthread_barrier_init(&bar, NULL, (unsigned)NT);
   uint32_t tail = 0, next = 0;
   for (;;) {   /* the main body first, in parallel; then each small leftover piece from its first unvisited node */
     if (tail == 0) next = root; else { while (next < N && nid[next] != UINT32_MAX) next++; if (next == N) break; }
     nid[next] = tail; order[tail] = next; qlo = tail; qhi = tail + 1;
-    if (tail == 0) { run(bfs); tail = qhi; continue; }
+    if (tail == 0) { run(bfs); tail = qhi; next = 0; continue; }
     tail++;
     for (uint32_t head = qlo; head < tail; head++) { uint32_t u = order[head];
       for (uint32_t e = off[u]; e < off[u + 1]; e++) { uint32_t v = adj[e].v; if (nid[v] == UINT32_MAX) { nid[v] = tail; order[tail++] = v; } } }
@@ -147,11 +148,12 @@ int main(int argc, char **argv) {
   cb[0] = body; cb[NT] = GS;
   for (int i = 1; i < NT; i++) { size_t e = body + (GS - body) * (size_t)i / (size_t)NT; if (e < cb[i - 1]) e = cb[i - 1]; while (e < GS && G[e - 1] != '\n') e++; cb[i] = e; }
   off = calloc((size_t)N + 2, 4); hasin = calloc(N, 1);
-  run(pass1);
-  for (uint32_t i = 0; i < N; i++) off[i + 1] += off[i];
+  run(pass1); run(scan);
+  { uint32_t s = 0; for (int t = 0; t < NT; t++) { uint32_t x = rsum[t]; rsum[t] = s; s += x; } off[N] = s; off[N + 1] = 1; }
+  run(scan);
   adj = malloc(sizeof(E) * ((size_t)off[N] + 1));
-  run(pass2);   /* leaves off[u] = end of u = start of u+1: shift back */
-  memmove(off + 1, off, 4 * (size_t)N); off[0] = 0;
+  run(pass2);
+  for (int t = 0; t < NT; t++) free(cnt[t]);
   size_t qsz; snprintf(path, sizeof path, "%s/queries.txt", data); const char *qf = mapfile(path, &qsz);
   Q = 0; for (size_t i = 0; i < qsz; i++) Q += qf[i] == '\n';
   qs = malloc(4 * (size_t)Q + 4); qt = malloc(4 * (size_t)Q + 4); ans = malloc(8 * (size_t)Q + 8);
